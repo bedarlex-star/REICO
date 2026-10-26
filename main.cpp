@@ -1226,6 +1226,7 @@ struct GlassConfig {
     int  iconGlassAmount = 65;          // % glass; the rest is the solid tinted icon (recognizability)
     bool nowPlaying = true;             // liquid-glass pop-up when a song starts / stops
     bool dock = false;                  // REICO's glass taskbar at the top (Windows' taskbar auto-hides)
+    bool btnGames = true, btnTaskMgr = true, btnNotes = true; // the round buttons at the top-left
     std::vector<std::wstring> classes{ L"CabinetWClass" }; // cmd is NOT default: too heavy
 };
 
@@ -1326,6 +1327,10 @@ void LoadGlassConfig() {
                "# dock: 1 = rounded glass taskbar centred at the top; Windows' own taskbar is set to\n"
                "# auto-hide while it's on and restored when it's off\n"
                "dock=0\n"
+               "# the round buttons at the top-left (with the dock): game launcher, Task Manager, board\n"
+               "btnGames=1\n"
+               "btnTaskMgr=1\n"
+               "btnNotes=1\n"
                "# one class= line per window type to affect\n"
                "class=CabinetWClass\n"
                "# cmd (ConsoleWindowClass) is heavy with blur - not enabled by default.\n"
@@ -1387,6 +1392,12 @@ void LoadGlassConfig() {
             g_glassCfg.iconGlassAmount = ga < 0 ? 0 : (ga > 100 ? 100 : ga);
         } else if (key == "dock") {
             g_glassCfg.dock = std::atoi(val.c_str()) != 0;
+        } else if (key == "btnGames") {
+            g_glassCfg.btnGames = std::atoi(val.c_str()) != 0;
+        } else if (key == "btnTaskMgr") {
+            g_glassCfg.btnTaskMgr = std::atoi(val.c_str()) != 0;
+        } else if (key == "btnNotes") {
+            g_glassCfg.btnNotes = std::atoi(val.c_str()) != 0;
         } else if (key == "nowPlaying") {
             g_glassCfg.nowPlaying = std::atoi(val.c_str()) != 0;
         } else if (key == "hoverEffect") {
@@ -3043,7 +3054,7 @@ const int PANEL_PREVIEW = 42;                                     // slider prev
 enum PanelCtlKind { CK_ACTION, CK_TOGGLE, CK_SLIDER, CK_SWATCH, CK_SEGMENT, CK_CHIP, CK_LINK, CK_SECTION, CK_LABEL, CK_WHEEL };
 enum {
     P_REFRESH = 1, P_EDIT, P_GLASS, P_LIQUID, P_ICONGLASS, P_ICONTINT,
-    P_TINTA, P_WALPHA, P_GLASSAMT, P_BRIGHT, P_EDGE, P_HOVER, P_SETTINGS, P_EXIT, P_NOWPLAY, P_DOCK,
+    P_TINTA, P_WALPHA, P_GLASSAMT, P_BRIGHT, P_EDGE, P_HOVER, P_SETTINGS, P_EXIT, P_NOWPLAY, P_DOCK, P_BTNGAMES, P_BTNTASK, P_BTNNOTES,
     P_WHEEL, P_TINTV,
     P_SWATCH = 100, P_PRESET = 200,
 };
@@ -3059,7 +3070,7 @@ struct PanelCtl {
 };
 
 struct PanelVals {
-    bool liquid, iconGlass, iconTint, nowPlaying, dock;
+    bool liquid, iconGlass, iconTint, nowPlaying, dock, btnGames, btnTaskMgr, btnNotes;
     int tintA, wAlpha, glassAmt, bright, edge, hover;
     COLORREF tint;
     float hue, sat;  // tint as hue (0..360) + saturation (0..1), for the colour wheel
@@ -3099,6 +3110,16 @@ bool g_pnlVisible = false, g_pnlClosing = false, g_pnlTimerOn = false;
 DWORD g_pnlAnimStart = 0, g_pnlLastClose = 0;
 float g_pnlOpenT = 0.f;
 int g_pnlHot = -1, g_pnlPressed = -1, g_pnlDrag = -1; // indexes into g_ctls
+bool g_pnlMoving = false;              // dragging the panel by its header
+POINT g_pnlMoveOff{};
+
+// Waits until the screen shows the latest frame (so a capture doesn't see what we just hid).
+void DwmFlushIfAvailable() {
+    typedef HRESULT (WINAPI *PFN_DwmFlush)();
+    static PFN_DwmFlush flush = reinterpret_cast<PFN_DwmFlush>(
+        reinterpret_cast<void*>(GetProcAddress(LoadLibraryW(L"dwmapi.dll"), "DwmFlush")));
+    if (flush) { flush(); flush(); } else Sleep(50);
+}
 HFONT g_fBody = nullptr, g_fSmall = nullptr, g_fBtn = nullptr, g_fTitle = nullptr, g_fLogo = nullptr;
 
 const COLORREF kSwatches[] = { RGB(85, 0, 0), RGB(0, 150, 150), RGB(30, 70, 170),
@@ -3110,6 +3131,9 @@ void PanelLoadVals() {
     g_pv.iconTint = g_glassCfg.iconTint;
     g_pv.nowPlaying = g_glassCfg.nowPlaying;
     g_pv.dock = g_glassCfg.dock;
+    g_pv.btnGames = g_glassCfg.btnGames;
+    g_pv.btnTaskMgr = g_glassCfg.btnTaskMgr;
+    g_pv.btnNotes = g_glassCfg.btnNotes;
     g_pv.tintA = g_glassCfg.tintAlpha;
     g_pv.wAlpha = g_glassCfg.windowAlpha;
     g_pv.glassAmt = g_glassCfg.iconGlassAmount;
@@ -3141,6 +3165,9 @@ bool* PanelToggleVal(int id) {
     case P_ICONTINT: return &g_pv.iconTint;
     case P_NOWPLAY: return &g_pv.nowPlaying;
     case P_DOCK: return &g_pv.dock;
+    case P_BTNGAMES: return &g_pv.btnGames;
+    case P_BTNTASK: return &g_pv.btnTaskMgr;
+    case P_BTNNOTES: return &g_pv.btnNotes;
     }
     return nullptr;
 }
@@ -3161,6 +3188,9 @@ void PanelApply() {
         { "hoverEffect", kHoverKeys[g_pv.hover] },
         { "nowPlaying", b(g_pv.nowPlaying) },
         { "dock", b(g_pv.dock) },
+        { "btnGames", b(g_pv.btnGames) },
+        { "btnTaskMgr", b(g_pv.btnTaskMgr) },
+        { "btnNotes", b(g_pv.btnNotes) },
     });
     ReloadConfig();
     UiFromConfig();
@@ -3217,7 +3247,10 @@ void PanelLayout() {
 
     add(CK_SECTION, 0, { L2, y, R2, y + 16 }, L"EXTRAS"); y += 22;
     add(CK_TOGGLE, P_NOWPLAY, { L2, y, R2, y + 28 }, L"Now playing pop-up"); y += 32;
-    add(CK_TOGGLE, P_DOCK, { L2, y, R2, y + 28 }, L"Glass taskbar (top)"); y += 34 + 10;
+    add(CK_TOGGLE, P_DOCK, { L2, y, R2, y + 28 }, L"Glass taskbar (top)"); y += 32;
+    add(CK_TOGGLE, P_BTNGAMES, { L2, y, R2, y + 28 }, L"Game launcher button"); y += 32;
+    add(CK_TOGGLE, P_BTNTASK, { L2, y, R2, y + 28 }, L"Task Manager button"); y += 32;
+    add(CK_TOGGLE, P_BTNNOTES, { L2, y, R2, y + 28 }, L"Board button"); y += 34 + 10;
 
     add(CK_SECTION, 0, { L2, y, R2, y + 16 }, L"PRESETS"); y += 22;
     g_pnlPresets = ListPresets();
@@ -3724,6 +3757,14 @@ LRESULT CALLBACK PanelProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             if (g_ctls[g_pnlDrag].kind == CK_WHEEL) PanelWheelTo(g_ctls[g_pnlDrag], p);
             else PanelSlideTo(g_ctls[g_pnlDrag], p.x);
         }
+        if (g_pnlMoving) {
+            POINT sp;
+            GetCursorPos(&sp);
+            g_pnlX = sp.x - g_pnlMoveOff.x;
+            g_pnlY = sp.y - g_pnlMoveOff.y;
+            PanelPresent();
+            return 0;
+        }
         int hot = PanelHit(p);
         bool seg = hot >= 0 && g_ctls[hot].kind == CK_SEGMENT; // its hover follows the cursor inside it
         if (hot != g_pnlHot || g_pnlDrag >= 0 || seg) { g_pnlHot = hot; PanelKick(); }
@@ -3748,12 +3789,32 @@ LRESULT CALLBACK PanelProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             SetCapture(h);
             PanelWheelTo(g_ctls[g_pnlDrag], p);
             PanelKick();
+        } else if (g_pnlPressed < 0 && p.y < 70) { // empty part of the header: move the panel
+            POINT sp;
+            GetCursorPos(&sp);
+            g_pnlMoving = true;
+            g_pnlMoveOff = { sp.x - g_pnlX, sp.y - g_pnlY };
+            SetCapture(h);
         }
         return 0;
     }
 
     case WM_LBUTTONUP: {
         POINT p{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        if (g_pnlMoving) {
+            ReleaseCapture();
+            g_pnlMoving = false;
+            // the frosted backdrop was captured at the old spot: hide for a frame, re-capture here
+            POINT src{ 0, 0 }, dst{ g_pnlX, g_pnlY };
+            SIZE sz{ PANEL_W, g_pnlH };
+            BLENDFUNCTION bf{ AC_SRC_OVER, 0, 0, AC_SRC_ALPHA };
+            UpdateLayeredWindow(h, nullptr, &dst, &sz, g_pnl.dc, &src, 0, &bf, ULW_ALPHA);
+            DwmFlushIfAvailable();
+            PanelCaptureBackdrop();
+            PanelBuildBase();
+            PanelPresent();
+            return 0;
+        }
         if (g_pnlDrag >= 0) {
             ReleaseCapture();
             g_pnlDrag = -1;
@@ -4517,11 +4578,21 @@ const int DOCK_WIN_H = 112;             // window: the strip + room for tooltips
 const int DOCK_TOP = 7, DOCK_H = 52, DOCK_R = 22;
 const int DOCK_SLOT = 46, DOCK_ICON = 32, DOCK_PAD = 10;
 const int DOCK_SEP = 12, DOCK_TRAY_W = 36, DOCK_CLOCK_W = 80;
-const int DOCK_GAMES_X = 12;            // the game launcher button, at the top-left of the strip
-const int DOCK_TASKMGR_X = DOCK_GAMES_X + DOCK_H + 8; // Task Manager button, right of it
+const int DOCK_SIDE_X = 12;             // the round buttons start at the top-left of the strip
+enum { SIDE_GAMES, SIDE_TASKMGR, SIDE_NOTES };
+
+// x of a top-left button (game launcher, Task Manager, board), or -1 when it's turned
+// off in the settings; the ones that are on are packed left to right.
+int DockSideX(int which) {
+    const bool on[3] = { g_glassCfg.btnGames, g_glassCfg.btnTaskMgr, g_glassCfg.btnNotes };
+    if (!on[which]) return -1;
+    int x = DOCK_SIDE_X;
+    for (int i = 0; i < which; ++i) if (on[i]) x += DOCK_H + 8;
+    return x;
+}
 const UINT WM_DOCK_APPBAR = WM_APP + 30;
 const UINT_PTR DOCK_ANIM_TIMER = 1, DOCK_TICK_TIMER = 2, DOCK_REFRESH_TIMER = 3;
-enum { DH_NONE = -1, DH_START = 1000, DH_TRAY, DH_CLOCK, DH_GAMES, DH_TASKMGR };
+enum { DH_NONE = -1, DH_START = 1000, DH_TRAY, DH_CLOCK, DH_GAMES, DH_TASKMGR, DH_NOTES };
 const wchar_t* TASKBAR_STATE_FILE = L"C:\\REICO\\taskbar_state.txt";
 
 struct DockApp {
@@ -4546,7 +4617,7 @@ RECT g_dockMon{};
 POINT g_dockOrigin{};
 float g_dockW = 0.f;
 int g_dockHot = DH_NONE;
-float g_dockStartHot = 0.f, g_dockTrayHot = 0.f, g_dockClockHot = 0.f, g_dockGamesHot = 0.f, g_dockTaskHot = 0.f;
+float g_dockStartHot = 0.f, g_dockTrayHot = 0.f, g_dockClockHot = 0.f, g_dockGamesHot = 0.f, g_dockTaskHot = 0.f, g_dockNotesHot = 0.f;
 DWORD g_dockHoverSince = 0;
 HWINEVENTHOOK g_dockHookFg = nullptr, g_dockHookObj = nullptr;
 HFONT g_dockGlyphF = nullptr, g_dockTimeF = nullptr, g_dockDateF = nullptr, g_dockTipF = nullptr, g_dockGamesF = nullptr;
@@ -4804,6 +4875,7 @@ bool DockAnimate() {
     ease(g_dockStartHot, g_dockHot == DH_START ? 1.f : 0.f, 0.3f, 0.01f);
     ease(g_dockGamesHot, g_dockHot == DH_GAMES ? 1.f : 0.f, 0.3f, 0.01f);
     ease(g_dockTaskHot, g_dockHot == DH_TASKMGR ? 1.f : 0.f, 0.3f, 0.01f);
+    ease(g_dockNotesHot, g_dockHot == DH_NOTES ? 1.f : 0.f, 0.3f, 0.01f);
     ease(g_dockTrayHot, g_dockHot == DH_TRAY ? 1.f : 0.f, 0.3f, 0.01f);
     ease(g_dockClockHot, g_dockHot == DH_CLOCK ? 1.f : 0.f, 0.3f, 0.01f);
     if (g_dockHot >= 0 && GetTickCount() - g_dockHoverSince < 700) moving = true; // tooltip still on its way
@@ -4871,23 +4943,21 @@ void DockRender() {
     FillRRect(c, L, T, R, B, DOCK_R, veil, 0.68f);
     GlassLight(c, L, T, R, B, DOCK_R, 1.f);
 
-    // game launcher: a round glass button at the top-left with a controller
+    // the round glass buttons at the top-left: game launcher, Task Manager, board
+    // (each can be turned off in the panel; the ones that are on pack left to right)
     {
-        const float gx0 = static_cast<float>(DOCK_GAMES_X), gx1 = gx0 + DOCK_H;
-        FillRRect(c, gx0, T, gx1, B, DOCK_R, veil, 0.68f);
-        if (g_dockGamesHot > 0.01f) FillRRect(c, gx0, T, gx1, B, DOCK_R, AccentColour(), 0.45f * g_dockGamesHot);
-        GlassLight(c, gx0, T, gx1, B, DOCK_R, 1.f);
-        DrawGlassText(c, g_dockMask, L"\uE7FC", { static_cast<LONG>(gx0), static_cast<LONG>(T), static_cast<LONG>(gx1), static_cast<LONG>(B) },
-                      g_dockGamesF, 1.f, DT_CENTER | DT_VCENTER | DT_SINGLELINE, 0.f, 0.9f);
-    }
-    // Task Manager: same round glass button, with a glass activity-graph glyph
-    {
-        const float tx0 = static_cast<float>(DOCK_TASKMGR_X), tx1 = tx0 + DOCK_H;
-        FillRRect(c, tx0, T, tx1, B, DOCK_R, veil, 0.68f);
-        if (g_dockTaskHot > 0.01f) FillRRect(c, tx0, T, tx1, B, DOCK_R, AccentColour(), 0.45f * g_dockTaskHot);
-        GlassLight(c, tx0, T, tx1, B, DOCK_R, 1.f);
-        DrawGlassText(c, g_dockMask, L"", { static_cast<LONG>(tx0), static_cast<LONG>(T), static_cast<LONG>(tx1), static_cast<LONG>(B) },
-                      g_dockGamesF, 1.f, DT_CENTER | DT_VCENTER | DT_SINGLELINE, 0.f, 0.9f);
+        const wchar_t glyphs[3][2] = { { 0xE7FC, 0 }, { 0xE9D9, 0 }, { 0xE70B, 0 } }; // controller, activity graph, note
+        const float hots[3] = { g_dockGamesHot, g_dockTaskHot, g_dockNotesHot };
+        for (int i = 0; i < 3; ++i) {
+            int bx = DockSideX(i);
+            if (bx < 0) continue;
+            const float x0 = static_cast<float>(bx), x1 = x0 + DOCK_H;
+            FillRRect(c, x0, T, x1, B, DOCK_R, veil, 0.68f);
+            if (hots[i] > 0.01f) FillRRect(c, x0, T, x1, B, DOCK_R, AccentColour(), 0.45f * hots[i]);
+            GlassLight(c, x0, T, x1, B, DOCK_R, 1.f);
+            DrawGlassText(c, g_dockMask, glyphs[i], { static_cast<LONG>(x0), static_cast<LONG>(T), static_cast<LONG>(x1), static_cast<LONG>(B) },
+                          g_dockGamesF, 1.f, DT_CENTER | DT_VCENTER | DT_SINGLELINE, 0.f, 0.9f);
+        }
     }
 
     // Start
@@ -6188,7 +6258,7 @@ void GameLauncherToggle() {
     g_glRow = 0;
     g_glHot = g_glPressed = GLH_NONE;
     GlRebuildView();
-    g_glX = g_dockOrigin.x + DOCK_GAMES_X;
+    g_glX = g_dockOrigin.x + DOCK_SIDE_X;
     g_glY = g_dockOrigin.y + DOCK_TOP + DOCK_H + 10;
     g_glVisible = true;
     g_glClosing = false;
@@ -6199,11 +6269,803 @@ void GameLauncherToggle() {
     GlKick();
 }
 
+// ---- the board (notes button): photos, notes and bucket lists ---------------
+//
+// A big glass board in the middle of the screen. Ctrl+V pastes a picture as an
+// Instax-style photo (white frame, thick bottom edge, a slight tilt, a shadow;
+// type to caption it). "+ Note" adds a glass sticky note, "+ List" a bucket list
+// (type + Enter adds an item, click the circle to tick it off). Everything can be
+// dragged around; right-click deletes. Saved as you go to the C:\REICO\board
+// folder (board.txt + one .bmp per photo). It's a normal window (not always-on-top), so
+// you can switch to another app to copy something and come back to paste.
+// Typing is deliberately simple: type, Backspace, Enter - no caret moving.
+
+enum { BI_PHOTO, BI_NOTE, BI_LIST };
+struct BoardEntry { std::wstring text; bool done = false; };
+struct BoardItem {
+    int kind = BI_NOTE;
+    float x = 0, y = 0, rot = 0;      // top-left on the board, tilt in degrees (photos)
+    int w = 230, h = 120;             // size on the board (h is laid out from the content)
+    std::wstring text;                // note text / photo caption / list title
+    std::vector<BoardEntry> entries;  // list items
+    std::wstring file;                // photo file name in C:\REICO\board
+    std::vector<UINT32> photo;        // photo pixels (opaque BGRA)
+    int pw = 0, ph = 0;
+    std::vector<UINT32> card;         // rendered photo card (frame + photo + caption), unrotated
+    bool cardDirty = true;
+};
+
+const wchar_t* BOARD_DIR = L"C:\\REICO\\board";
+const UINT_PTR BD_ANIM_TIMER = 1, BD_CARET_TIMER = 2, BD_SAVE_TIMER = 3;
+const int BD_HEAD = 64, BD_PHOTO_W = 220;
+
+HWND g_bdWnd = nullptr;
+Surface g_bdS, g_bdMask;
+std::vector<UINT32> g_bdBase;
+std::vector<BoardItem> g_bd;            // drawing order: last = on top
+int g_bdW = 0, g_bdH = 0, g_bdX = 0, g_bdY = 0;
+int g_bdFocus = -1, g_bdDrag = -1, g_bdHotBtn = -1;
+POINT g_bdDragOff{};
+bool g_bdDragMoved = false;
+std::wstring g_bdPending;               // list item being typed
+bool g_bdEditTitle = false;             // typing goes to the focused list's title instead
+bool g_bdMoveWin = false;               // dragging the whole board by its header
+POINT g_bdMoveOff{};
+bool g_bdVisible = false, g_bdClosing = false, g_bdLoaded = false, g_bdCaretOn = true;
+DWORD g_bdAnimStart = 0;
+HFONT g_bdTitleF = nullptr, g_bdTextF = nullptr, g_bdListTitleF = nullptr, g_bdBtnF = nullptr, g_bdCapF = nullptr,
+      g_bdGlyphF = nullptr, g_bdHintF = nullptr;
+
+// -- storage --
+
+std::wstring BdEsc(const std::wstring& s) {
+    std::wstring o;
+    for (wchar_t c : s) { if (c == L'\\') o += L"\\\\"; else if (c == L'\n') o += L"\\n"; else if (c == L'\t') o += L"\\t"; else o += c; }
+    return o;
+}
+std::wstring BdUnesc(const std::wstring& s) {
+    std::wstring o;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == L'\\' && i + 1 < s.size()) { wchar_t n = s[++i]; o += n == L'n' ? L'\n' : n == L't' ? L'\t' : n; }
+        else o += s[i];
+    }
+    return o;
+}
+
+bool SaveBmp32(const std::wstring& path, const std::vector<UINT32>& px, int w, int h) {
+    BITMAPFILEHEADER fh{}; BITMAPINFOHEADER ih{};
+    ih.biSize = sizeof(ih); ih.biWidth = w; ih.biHeight = -h; ih.biPlanes = 1; ih.biBitCount = 32;
+    fh.bfType = 0x4D42; fh.bfOffBits = sizeof(fh) + sizeof(ih); fh.bfSize = fh.bfOffBits + static_cast<DWORD>(w) * h * 4;
+    std::ofstream o(fs::path(path), std::ios::binary);
+    o.write(reinterpret_cast<const char*>(&fh), sizeof(fh));
+    o.write(reinterpret_cast<const char*>(&ih), sizeof(ih));
+    o.write(reinterpret_cast<const char*>(px.data()), static_cast<std::streamsize>(px.size()) * 4);
+    return static_cast<bool>(o);
+}
+bool LoadBmp32(const std::wstring& path, std::vector<UINT32>& px, int& w, int& h) { // only reads what SaveBmp32 writes
+    std::ifstream in(fs::path(path), std::ios::binary);
+    BITMAPFILEHEADER fh{}; BITMAPINFOHEADER ih{};
+    if (!in.read(reinterpret_cast<char*>(&fh), sizeof(fh)) || !in.read(reinterpret_cast<char*>(&ih), sizeof(ih))) return false;
+    if (fh.bfType != 0x4D42 || ih.biBitCount != 32 || ih.biHeight >= 0 || ih.biWidth <= 0 || ih.biWidth > 4096 || -ih.biHeight > 4096) return false;
+    w = ih.biWidth; h = -ih.biHeight;
+    px.resize(static_cast<size_t>(w) * h);
+    return static_cast<bool>(in.read(reinterpret_cast<char*>(px.data()), static_cast<std::streamsize>(px.size()) * 4));
+}
+
+void BdSave() {
+    std::error_code ec;
+    fs::create_directories(BOARD_DIR, ec);
+    std::wstring t;
+    wchar_t num[96];
+    for (const auto& it : g_bd) {
+        swprintf(num, 96, L"%.0f\t%.0f\t", it.x, it.y);
+        if (it.kind == BI_PHOTO) {
+            wchar_t r[32]; swprintf(r, 32, L"%.1f", it.rot);
+            t += L"P\t" + std::wstring(num) + r + L"\t" + it.file + L"\t" + BdEsc(it.text) + L"\n";
+        } else if (it.kind == BI_NOTE) {
+            t += L"N\t" + std::wstring(num) + std::to_wstring(it.w) + L"\t" + BdEsc(it.text) + L"\n";
+        } else {
+            t += L"L\t" + std::wstring(num) + std::to_wstring(it.w) + L"\t" + BdEsc(it.text) + L"\n";
+            for (const auto& e : it.entries) t += std::wstring(L"E\t") + (e.done ? L"1" : L"0") + L"\t" + BdEsc(e.text) + L"\n";
+        }
+    }
+    WriteUtf8(L"C:\\REICO\\board\\board.txt", t);
+}
+void BdSaveSoon() { if (g_bdWnd) SetTimer(g_bdWnd, BD_SAVE_TIMER, 600, nullptr); }
+
+void BdLoad() {
+    g_bd.clear();
+    std::wstringstream ss(ReadTextFile(L"C:\\REICO\\board\\board.txt"));
+    std::wstring line;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        std::vector<std::wstring> f;
+        size_t s = 0;
+        for (size_t p; (p = line.find(L'\t', s)) != std::wstring::npos; s = p + 1) f.push_back(line.substr(s, p - s));
+        f.push_back(line.substr(s));
+        if (f[0] == L"E" && f.size() >= 3 && !g_bd.empty() && g_bd.back().kind == BI_LIST) {
+            g_bd.back().entries.push_back({ BdUnesc(f[2]), f[1] == L"1" });
+            continue;
+        }
+        if (f.size() < 5) continue;
+        BoardItem it;
+        it.x = static_cast<float>(_wtof(f[1].c_str()));
+        it.y = static_cast<float>(_wtof(f[2].c_str()));
+        if (f[0] == L"P" && f.size() >= 6) {
+            it.kind = BI_PHOTO;
+            it.rot = static_cast<float>(_wtof(f[3].c_str()));
+            it.file = f[4];
+            it.text = BdUnesc(f[5]);
+            if (!LoadBmp32(std::wstring(BOARD_DIR) + L"\\" + it.file, it.photo, it.pw, it.ph)) continue;
+        } else if (f[0] == L"N" || f[0] == L"L") {
+            it.kind = f[0] == L"N" ? BI_NOTE : BI_LIST;
+            it.w = std::max(160, _wtoi(f[3].c_str()));
+            it.text = BdUnesc(f[4]);
+        } else continue;
+        g_bd.push_back(std::move(it));
+    }
+    g_bdLoaded = true;
+}
+
+// -- pictures: clipboard bitmap or an image file, scaled down to at most 640 px --
+
+std::vector<UINT32> ScaleImage(const std::vector<UINT32>& src, int sw, int sh, int& dw, int& dh, int maxSide) {
+    float k = std::min(1.f, static_cast<float>(maxSide) / std::max(sw, sh));
+    dw = std::max(1, static_cast<int>(sw * k)); dh = std::max(1, static_cast<int>(sh * k));
+    std::vector<UINT32> out(static_cast<size_t>(dw) * dh);
+    for (int y = 0; y < dh; ++y) {
+        int y0 = y * sh / dh, y1 = std::max(y0 + 1, (y + 1) * sh / dh);
+        for (int x = 0; x < dw; ++x) {
+            int x0 = x * sw / dw, x1 = std::max(x0 + 1, (x + 1) * sw / dw);
+            UINT32 r = 0, g = 0, b = 0, n = 0;
+            for (int yy = y0; yy < y1; ++yy)
+                for (int xx = x0; xx < x1; ++xx, ++n) {
+                    UINT32 p = src[static_cast<size_t>(yy) * sw + xx];
+                    r += (p >> 16) & 0xFF; g += (p >> 8) & 0xFF; b += p & 0xFF;
+                }
+            out[static_cast<size_t>(y) * dw + x] = 0xFF000000 | ((r / n) << 16) | ((g / n) << 8) | (b / n);
+        }
+    }
+    return out;
+}
+
+bool ImageFromBitmap(HBITMAP hb, std::vector<UINT32>& px, int& w, int& h) {
+    BITMAP bm{};
+    if (!GetObject(hb, sizeof(bm), &bm) || bm.bmWidth <= 0 || bm.bmHeight <= 0) return false;
+    w = bm.bmWidth; h = bm.bmHeight;
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    px.resize(static_cast<size_t>(w) * h);
+    HDC dc = GetDC(nullptr);
+    int ok = GetDIBits(dc, hb, 0, h, px.data(), &bi, DIB_RGB_COLORS);
+    ReleaseDC(nullptr, dc);
+    for (auto& p : px) p |= 0xFF000000; // clipboard pictures: opaque
+    return ok != 0;
+}
+
+bool ImageFromFile(const std::wstring& path, std::vector<UINT32>& px, int& w, int& h) {
+    typedef HRESULT (WINAPI *PFN_CoCreate)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
+    static PFN_CoCreate coCreate = reinterpret_cast<PFN_CoCreate>(
+        reinterpret_cast<void*>(GetProcAddress(LoadLibraryW(L"ole32.dll"), "CoCreateInstance")));
+    if (!coCreate) return false;
+    IWICImagingFactory* wic = nullptr;
+    IWICBitmapDecoder* dec = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* conv = nullptr;
+    UINT uw = 0, uh = 0;
+    bool ok = SUCCEEDED(coCreate(np::CLSID_WicFactory, nullptr, CLSCTX_INPROC_SERVER, np::IID_WicFactory, reinterpret_cast<void**>(&wic))) &&
+              SUCCEEDED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &dec)) &&
+              SUCCEEDED(dec->GetFrame(0, &frame)) && SUCCEEDED(frame->GetSize(&uw, &uh)) && uw && uh && uw <= 16000 && uh <= 16000 &&
+              SUCCEEDED(wic->CreateFormatConverter(&conv)) &&
+              SUCCEEDED(conv->Initialize(frame, np::FMT_32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom));
+    if (ok) {
+        w = static_cast<int>(uw); h = static_cast<int>(uh);
+        px.resize(static_cast<size_t>(w) * h);
+        ok = SUCCEEDED(conv->CopyPixels(nullptr, w * 4, w * h * 4, reinterpret_cast<BYTE*>(px.data())));
+        for (auto& p : px) { // transparent parts become white paper
+            UINT32 a = p >> 24, inv = 255 - a;
+            p = 0xFF000000 | (std::min(255u, ((p >> 16) & 0xFF) + inv) << 16) | (std::min(255u, ((p >> 8) & 0xFF) + inv) << 8) | std::min(255u, (p & 0xFF) + inv);
+        }
+    }
+    for (IUnknown* u : std::initializer_list<IUnknown*>{ conv, frame, dec, wic }) if (u) u->Release();
+    return ok;
+}
+
+// -- layout + drawing --
+
+int BdTextHeight(const std::wstring& t, HFONT f, int width) {
+    RECT r{ 0, 0, width, 0 };
+    HGDIOBJ of = SelectObject(g_bdMask.dc, f);
+    DrawTextW(g_bdMask.dc, t.empty() ? L" " : t.c_str(), -1, &r, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+    SelectObject(g_bdMask.dc, of);
+    return r.bottom;
+}
+
+void BdLayout(BoardItem& it) {
+    if (it.kind == BI_PHOTO) {
+        int ph = it.pw > 0 ? std::min(300, std::max(150, BD_PHOTO_W * it.ph / it.pw)) : 200;
+        it.w = BD_PHOTO_W + 24;
+        it.h = 12 + ph + 50;
+    } else if (it.kind == BI_NOTE) {
+        it.h = std::max(120, BdTextHeight(it.text, g_bdTextF, it.w - 32) + 36);
+    } else {
+        it.h = 52 + static_cast<int>(it.entries.size()) * 30 + 38;
+    }
+}
+
+// cover-fit, bilinear: fills x,y,w,h with the picture, cropping the overflow
+void BlitImageCover(Canvas c, const std::vector<UINT32>& src, int sw, int sh, float x0, float y0, float w, float h) {
+    float k = std::max(w / sw, h / sh), ox = (sw * k - w) / 2.f, oy = (sh * k - h) / 2.f;
+    for (int y = std::max(0, static_cast<int>(y0)); y < std::min(c.h, static_cast<int>(y0 + h)); ++y)
+        for (int x = std::max(0, static_cast<int>(x0)); x < std::min(c.w, static_cast<int>(x0 + w)); ++x) {
+            float u = (x - x0 + ox + 0.5f) / k - 0.5f, v = (y - y0 + oy + 0.5f) / k - 0.5f;
+            int ux = std::max(0, std::min(sw - 2, static_cast<int>(u))), vy = std::max(0, std::min(sh - 2, static_cast<int>(v)));
+            float fx = Clamp01(u - ux), fy = Clamp01(v - vy);
+            float ch[3] = {};
+            for (int s = 0; s < 3; ++s) {
+                auto at = [&](int xx, int yy) { return static_cast<float>((src[static_cast<size_t>(yy) * sw + xx] >> (16 - 8 * s)) & 0xFF); };
+                ch[s] = at(ux, vy) * (1 - fx) * (1 - fy) + at(ux + 1, vy) * fx * (1 - fy) + at(ux, vy + 1) * (1 - fx) * fy + at(ux + 1, vy + 1) * fx * fy;
+            }
+            Over(c.px[static_cast<size_t>(y) * c.w + x], ch[0], ch[1], ch[2], 1.f);
+        }
+}
+
+// The Instax look: off-white frame, thick bottom edge with the caption, rendered once.
+void BdRenderCard(BoardItem& it, bool caret) {
+    BdLayout(it);
+    Surface s, m;
+    if (!SurfCreate(s, it.w, it.h) || !SurfCreate(m, it.w, it.h)) return;
+    FillRRect(s.cv(), 0.5f, 0.5f, it.w - 0.5f, it.h - 0.5f, 3.f, RGB(250, 249, 244), 1.f);
+    int ph = it.h - 12 - 50;
+    BlitImageCover(s.cv(), it.photo, it.pw, it.ph, 12.f, 12.f, static_cast<float>(BD_PHOTO_W), static_cast<float>(ph));
+    FillRRect(s.cv(), 12.f, 12.f, 12.f + BD_PHOTO_W, 12.f + ph, 0.f, RGB(0, 0, 0), 0.04f); // a touch of print sheen
+    std::wstring cap = it.text + (caret ? L"|" : L"");
+    DrawTextOn(s.cv(), m, cap.c_str(), { 12, 12 + ph + 4, it.w - 12, it.h - 4 }, g_bdCapF, RGB(55, 55, 60), 0.92f,
+               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    it.card.assign(s.px, s.px + static_cast<size_t>(it.w) * it.h);
+    it.cardDirty = false;
+    SurfFree(s);
+    SurfFree(m);
+}
+
+// board point -> the card's own (unrotated) coordinates
+void BdToCard(const BoardItem& it, float bx, float by, float& u, float& v) {
+    float cx = it.x + it.w / 2.f, cy = it.y + it.h / 2.f, a = -it.rot * 3.14159265f / 180.f;
+    float dx = bx - cx, dy = by - cy;
+    u = dx * std::cos(a) - dy * std::sin(a) + it.w / 2.f;
+    v = dx * std::sin(a) + dy * std::cos(a) + it.h / 2.f;
+}
+
+void BdDrawPhoto(Canvas c, BoardItem& it, bool focused) {
+    if (it.cardDirty || focused) BdRenderCard(it, focused && g_bdCaretOn);
+    if (it.card.empty()) return;
+    float cx = it.x + it.w / 2.f, cy = it.y + it.h / 2.f, rad = std::sqrt(static_cast<float>(it.w * it.w + it.h * it.h)) / 2.f + 12.f;
+    auto sample = [&](float u, float v, float out[4]) { // bilinear, premultiplied
+        out[0] = out[1] = out[2] = out[3] = 0.f;
+        if (u < -1 || v < -1 || u > it.w || v > it.h) return;
+        int ux = static_cast<int>(std::floor(u - 0.5f)), vy = static_cast<int>(std::floor(v - 0.5f));
+        float fx = u - 0.5f - ux, fy = v - 0.5f - vy;
+        for (int k = 0; k < 4; ++k) {
+            int xx = ux + (k & 1), yy = vy + (k >> 1);
+            if (xx < 0 || yy < 0 || xx >= it.w || yy >= it.h) continue;
+            float wgt = ((k & 1) ? fx : 1 - fx) * ((k >> 1) ? fy : 1 - fy);
+            UINT32 p = it.card[static_cast<size_t>(yy) * it.w + xx];
+            out[0] += (p >> 24) * wgt; out[1] += ((p >> 16) & 0xFF) * wgt; out[2] += ((p >> 8) & 0xFF) * wgt; out[3] += (p & 0xFF) * wgt;
+        }
+    };
+    for (int y = std::max(0, static_cast<int>(cy - rad)); y < std::min(c.h, static_cast<int>(cy + rad + 10)); ++y)
+        for (int x = std::max(0, static_cast<int>(cx - rad)); x < std::min(c.w, static_cast<int>(cx + rad + 8)); ++x) {
+            UINT32& p = c.px[static_cast<size_t>(y) * c.w + x];
+            float u, v, s[4];
+            BdToCard(it, x + 0.5f - 5.f, y + 0.5f - 8.f, u, v); // soft drop shadow, down-right
+            sample(u, v, s);
+            if (s[0] > 0.f) Over(p, 0, 0, 0, s[0] / 255.f * 0.32f);
+            BdToCard(it, x + 0.5f, y + 0.5f, u, v);
+            sample(u, v, s);
+            if (s[0] > 0.f) { float a = s[0] / 255.f; Over(p, s[1] / a, s[2] / a, s[3] / a, a); }
+        }
+}
+
+COLORREF BdVeil() {
+    COLORREF tint = RGB(g_glassCfg.tintR, g_glassCfg.tintG, g_glassCfg.tintB);
+    return RGB(GetRValue(tint) * 3 / 10 + 14, GetGValue(tint) * 3 / 10 + 14, GetBValue(tint) * 3 / 10 + 18);
+}
+
+void BdDrawNote(Canvas c, BoardItem& it, bool focused) {
+    const COLORREF white = RGB(255, 255, 255), acc = AccentColour();
+    BdLayout(it);
+    float x0 = it.x, y0 = it.y, x1 = it.x + it.w, y1 = it.y + it.h;
+    FillRRect(c, x0 + 4, y0 + 6, x1 + 4, y1 + 6, 18, RGB(0, 0, 0), 0.22f); // shadow
+    FillRRect(c, x0, y0, x1, y1, 18, BdVeil(), 0.85f);
+    FillRRect(c, x0, y0, x1, y1, 18, acc, focused ? 0.22f : 0.14f);
+    GlassLight(c, x0, y0, x1, y1, 18, focused ? 1.f : 0.8f);
+    std::wstring t = it.text + (focused && g_bdCaretOn ? L"|" : L"");
+    if (it.text.empty() && !focused) t = L"Click and type\u2026";
+    DrawTextOn(c, g_bdMask, t.c_str(), { static_cast<LONG>(x0 + 16), static_cast<LONG>(y0 + 16), static_cast<LONG>(x1 - 16), static_cast<LONG>(y1 - 12) },
+               g_bdTextF, white, it.text.empty() && !focused ? 0.45f : 0.95f, DT_LEFT | DT_WORDBREAK);
+}
+
+RECT BdListRow(const BoardItem& it, int i) {
+    LONG top = static_cast<LONG>(it.y) + 52 + i * 30;
+    return { static_cast<LONG>(it.x) + 14, top, static_cast<LONG>(it.x) + it.w - 14, top + 28 };
+}
+
+void BdDrawList(Canvas c, BoardItem& it, bool focused) {
+    const COLORREF white = RGB(255, 255, 255), acc = AccentColour();
+    BdLayout(it);
+    float x0 = it.x, y0 = it.y, x1 = it.x + it.w, y1 = it.y + it.h;
+    FillRRect(c, x0 + 4, y0 + 6, x1 + 4, y1 + 6, 18, RGB(0, 0, 0), 0.22f);
+    FillRRect(c, x0, y0, x1, y1, 18, BdVeil(), 0.88f);
+    if (focused) FillRRect(c, x0, y0, x1, y1, 18, acc, 0.12f);
+    GlassLight(c, x0, y0, x1, y1, 18, focused ? 1.f : 0.8f);
+    bool editingTitle = focused && g_bdEditTitle;
+    RECT titleR{ static_cast<LONG>(x0 + 16), static_cast<LONG>(y0 + 12), static_cast<LONG>(x1 - 16), static_cast<LONG>(y0 + 44) };
+    if (editingTitle) { // a soft field behind the title while renaming
+        FillRRect(c, x0 + 10, y0 + 10, x1 - 10, y0 + 46, 10, RGB(255, 255, 255), 0.08f);
+        GlassLight(c, x0 + 10, y0 + 10, x1 - 10, y0 + 46, 10, 0.5f);
+    }
+    std::wstring title = editingTitle ? it.text + (g_bdCaretOn ? L"|" : L"") : (it.text.empty() ? L"Bucket list" : it.text);
+    if (editingTitle && it.text.empty() && !g_bdCaretOn) title = L"Name this list";
+    DrawGlassText(c, g_bdMask, title.c_str(), titleR, g_bdListTitleF, editingTitle && it.text.empty() ? 0.5f : 1.f,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 0.25f, 0.75f);
+    for (int i = 0; i < static_cast<int>(it.entries.size()); ++i) {
+        const BoardEntry& e = it.entries[i];
+        RECT r = BdListRow(it, i);
+        float cx = r.left + 11.f, cy = (r.top + r.bottom) / 2.f;
+        if (e.done) {
+            FillCircle(c, cx, cy, 9.f, acc, 0.95f);
+            GlassLight(c, cx - 9, cy - 9, cx + 9, cy + 9, 9, 0.9f);
+            DrawTextOn(c, g_bdMask, L"\uE73E", { r.left + 2, r.top, r.left + 21, r.bottom }, g_bdGlyphF, white, 1.f,
+                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            FillCircle(c, cx, cy, 9.f, white, 0.10f);
+            GlassLight(c, cx - 9, cy - 9, cx + 9, cy + 9, 9, 0.9f);
+        }
+        RECT tr{ r.left + 30, r.top, r.right, r.bottom };
+        DrawTextOn(c, g_bdMask, e.text.c_str(), tr, g_bdTextF, white, e.done ? 0.45f : 0.95f, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (e.done) { // crossed off
+            int tw = std::min(static_cast<int>(tr.right - tr.left), TextWidth(e.text.c_str(), g_bdTextF));
+            FillRRect(c, tr.left - 2.f, cy - 0.75f, tr.left + tw + 2.f, cy + 0.75f, 0.75f, white, 0.6f);
+        }
+    }
+    RECT add = BdListRow(it, static_cast<int>(it.entries.size()));
+    add.top += 4; add.bottom += 4;
+    std::wstring line = focused && !g_bdEditTitle ? (L"+  " + g_bdPending + (g_bdCaretOn ? L"|" : L"")) : L"+  Add item";
+    DrawTextOn(c, g_bdMask, line.c_str(), { add.left + 2, add.top, add.right, add.bottom }, g_bdTextF, white,
+               focused && !g_bdPending.empty() ? 0.95f : 0.45f, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+// header buttons: 0 + Note, 1 + List, 2 Paste photo, 3 close
+RECT BdBtn(int i) {
+    if (i == 3) return { g_bdW - 52, 16, g_bdW - 18, 50 };
+    int x = 150 + i * 132;
+    return { x, 16, x + 122, 50 };
+}
+
+void BdBuildBase() {
+    g_bdBase.assign(static_cast<size_t>(g_bdW) * g_bdH, 0);
+    Canvas c{ g_bdBase.data(), g_bdW, g_bdH };
+    FillRRect(c, 0.5f, 0.5f, g_bdW - 0.5f, g_bdH - 0.5f, 26, BdVeil(), 0.9f);
+    for (int y = BD_HEAD + 20; y < g_bdH - 10; y += 26) // a faint dot grid, like a pinboard
+        for (int x = 20; x < g_bdW - 10; x += 26) FillCircle(c, static_cast<float>(x), static_cast<float>(y), 1.2f, RGB(255, 255, 255), 0.07f);
+    GlassLight(c, 0.5f, 0.5f, g_bdW - 0.5f, g_bdH - 0.5f, 26, 1.f);
+    FillRRect(c, 18, BD_HEAD - 1.f, g_bdW - 18.f, static_cast<float>(BD_HEAD), 0.5f, RGB(255, 255, 255), 0.12f);
+    DrawGlassText(c, g_bdMask, L"Board", { 22, 10, 140, 56 }, g_bdTitleF, 1.f, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 0.25f, 0.75f);
+    DrawTextOn(c, g_bdMask, L"Ctrl+V pastes a photo  \u00B7  drag to arrange  \u00B7  right-click to delete",
+               { 560, 16, g_bdW - 70, 50 }, g_bdHintF, RGB(255, 255, 255), 0.45f, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+void BdRender() {
+    if (!g_bdS.px) return;
+    DWORD now = GetTickCount();
+    float p = Clamp01((now - g_bdAnimStart) / (g_bdClosing ? 140.f : 220.f));
+    float open = g_bdClosing ? 1.f - p : EaseOut3(p);
+    memcpy(g_bdS.px, g_bdBase.data(), g_bdBase.size() * 4);
+    Canvas c = g_bdS.cv();
+    const COLORREF white = RGB(255, 255, 255);
+
+    static const wchar_t* labels[] = { L"+  Note", L"+  List", L"Paste photo" };
+    for (int i = 0; i < 4; ++i) {
+        RECT r = BdBtn(i);
+        bool hot = g_bdHotBtn == i;
+        GlassBlob(c, static_cast<float>(r.left), static_cast<float>(r.top), static_cast<float>(r.right), static_cast<float>(r.bottom),
+                  17, hot ? 0.5f : 0.f, hot ? 0.16f : 0.09f, 1.f);
+        if (i < 3) DrawTextOn(c, g_bdMask, labels[i], r, g_bdBtnF, white, 0.95f, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        else DrawGlassText(c, g_bdMask, L"\uE711", r, g_bdGlyphF, 1.f, DT_CENTER | DT_VCENTER | DT_SINGLELINE, 0.f, 0.85f);
+    }
+
+    if (g_bd.empty())
+        DrawTextOn(c, g_bdMask, L"Your board is empty - paste a photo with Ctrl+V, or add a note or a list above",
+                   { 20, g_bdH / 2 - 20, g_bdW - 20, g_bdH / 2 + 20 }, g_bdTextF, white, 0.5f, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    for (int i = 0; i < static_cast<int>(g_bd.size()); ++i) {
+        bool f = i == g_bdFocus;
+        if (g_bd[i].kind == BI_PHOTO) BdDrawPhoto(c, g_bd[i], f);
+        else if (g_bd[i].kind == BI_NOTE) BdDrawNote(c, g_bd[i], f);
+        else BdDrawList(c, g_bd[i], f);
+    }
+
+    POINT dst{ g_bdX, g_bdY + static_cast<int>((1.f - open) * 14.f) }, src{ 0, 0 };
+    SIZE sz{ g_bdW, g_bdH };
+    BLENDFUNCTION bf{ AC_SRC_OVER, 0, static_cast<BYTE>(255.f * open), AC_SRC_ALPHA };
+    UpdateLayeredWindow(g_bdWnd, nullptr, &dst, &sz, g_bdS.dc, &src, 0, &bf, ULW_ALPHA);
+}
+
+// -- editing --
+
+int BdHit(POINT p) { // topmost item under the point
+    for (int i = static_cast<int>(g_bd.size()) - 1; i >= 0; --i) {
+        const BoardItem& it = g_bd[i];
+        if (it.kind == BI_PHOTO) {
+            float u, v;
+            BdToCard(it, p.x + 0.5f, p.y + 0.5f, u, v);
+            if (u >= 0 && v >= 0 && u < it.w && v < it.h) return i;
+        } else if (p.x >= it.x && p.y >= it.y && p.x < it.x + it.w && p.y < it.y + it.h) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int BdBringToFront(int i) {
+    if (i < 0 || i == static_cast<int>(g_bd.size()) - 1) return i;
+    BoardItem it = std::move(g_bd[i]);
+    g_bd.erase(g_bd.begin() + i);
+    g_bd.push_back(std::move(it));
+    return static_cast<int>(g_bd.size()) - 1;
+}
+
+POINT BdDropPoint(int w, int h) { // where new things land: around the middle, a little scattered
+    static int n = 0;
+    ++n;
+    return { std::max(20, g_bdW / 2 - w / 2 + ((n * 47) % 160) - 80), std::max(BD_HEAD + 12, g_bdH / 2 - h / 2 + ((n * 31) % 120) - 60) };
+}
+
+void BdKick() { if (g_bdWnd) SetTimer(g_bdWnd, BD_ANIM_TIMER, 15, nullptr); }
+
+void BdFocus(int i) {
+    if (g_bdFocus >= 0 && g_bdFocus < static_cast<int>(g_bd.size())) {
+        BoardItem& old = g_bd[g_bdFocus];
+        if (old.kind == BI_PHOTO) old.cardDirty = true;
+        if (old.kind == BI_LIST && old.text.empty()) old.text = L"Bucket list"; // left the title blank
+    }
+    if (i != g_bdFocus) { g_bdPending.clear(); g_bdEditTitle = false; }
+    g_bdFocus = i;
+    g_bdCaretOn = true;
+    if (g_bdWnd) {
+        if (i >= 0) SetTimer(g_bdWnd, BD_CARET_TIMER, 530, nullptr);
+        else KillTimer(g_bdWnd, BD_CARET_TIMER);
+    }
+}
+
+void BdAddPhoto(std::vector<UINT32> px, int w, int h) {
+    int dw = 0, dh = 0;
+    std::vector<UINT32> small = ScaleImage(px, w, h, dw, dh, 640);
+    std::error_code ec;
+    fs::create_directories(BOARD_DIR, ec);
+    wchar_t name[64];
+    swprintf(name, 64, L"photo_%llu.bmp", static_cast<unsigned long long>(GetTickCount64()));
+    if (!SaveBmp32(std::wstring(BOARD_DIR) + L"\\" + name, small, dw, dh)) return;
+    BoardItem it;
+    it.kind = BI_PHOTO;
+    it.file = name;
+    it.photo = std::move(small);
+    it.pw = dw; it.ph = dh;
+    it.rot = static_cast<float>(static_cast<int>(GetTickCount() % 11) - 5); // -5..+5 degrees, like it was tossed on
+    BdLayout(it);
+    POINT at = BdDropPoint(it.w, it.h);
+    it.x = static_cast<float>(at.x); it.y = static_cast<float>(at.y);
+    g_bd.push_back(std::move(it));
+    BdFocus(static_cast<int>(g_bd.size()) - 1);
+    BdSaveSoon();
+}
+
+void BdAddNote(const std::wstring& text) {
+    BoardItem it;
+    it.kind = BI_NOTE;
+    it.w = 240;
+    it.text = text;
+    BdLayout(it);
+    POINT at = BdDropPoint(it.w, it.h);
+    it.x = static_cast<float>(at.x); it.y = static_cast<float>(at.y);
+    g_bd.push_back(std::move(it));
+    BdFocus(static_cast<int>(g_bd.size()) - 1);
+    BdSaveSoon();
+}
+
+void BdAddList() {
+    BoardItem it;
+    it.kind = BI_LIST;
+    it.w = 280;
+    BdLayout(it);
+    POINT at = BdDropPoint(it.w, it.h);
+    it.x = static_cast<float>(at.x); it.y = static_cast<float>(at.y);
+    g_bd.push_back(std::move(it));
+    BdFocus(static_cast<int>(g_bd.size()) - 1);
+    g_bdEditTitle = true; // name it first; Enter moves on to adding items (blank = "Bucket list")
+    BdSaveSoon();
+}
+
+void BdDelete(int i) {
+    if (i < 0 || i >= static_cast<int>(g_bd.size())) return;
+    if (g_bd[i].kind == BI_PHOTO) DeleteFileW((std::wstring(BOARD_DIR) + L"\\" + g_bd[i].file).c_str());
+    g_bd.erase(g_bd.begin() + i);
+    BdFocus(-1);
+    BdSaveSoon();
+}
+
+// Ctrl+V: a picture (copied image, or an image file copied in Explorer) or text.
+void BdPaste() {
+    if (!OpenClipboard(g_bdWnd)) return;
+    std::vector<UINT32> px;
+    int w = 0, h = 0;
+    bool image = false;
+    if (HANDLE hb = GetClipboardData(CF_BITMAP)) image = ImageFromBitmap(static_cast<HBITMAP>(hb), px, w, h);
+    std::wstring file, text;
+    if (!image) {
+        if (HANDLE hd = GetClipboardData(CF_HDROP)) {
+            wchar_t f[MAX_PATH]{};
+            if (DragQueryFileW(static_cast<HDROP>(hd), 0, f, MAX_PATH)) file = f;
+        }
+        if (HANDLE ht = GetClipboardData(CF_UNICODETEXT)) {
+            if (const wchar_t* s = static_cast<const wchar_t*>(GlobalLock(ht))) { text = s; GlobalUnlock(ht); }
+        }
+    }
+    CloseClipboard();
+
+    if (!image && !file.empty()) {
+        std::wstring ext = LowerStr(fs::path(file).extension().wstring());
+        if (ext == L".png" || ext == L".jpg" || ext == L".jpeg" || ext == L".bmp" || ext == L".gif" || ext == L".tif" ||
+            ext == L".tiff" || ext == L".webp" || ext == L".heic")
+            image = ImageFromFile(file, px, w, h);
+    }
+    if (image) { BdAddPhoto(std::move(px), w, h); BdKick(); return; }
+    if (text.empty()) return;
+    text.erase(std::remove(text.begin(), text.end(), L'\r'), text.end());
+    if (g_bdFocus >= 0 && g_bd[g_bdFocus].kind == BI_NOTE) g_bd[g_bdFocus].text += text;
+    else if (g_bdFocus >= 0 && g_bd[g_bdFocus].kind == BI_LIST) {
+        std::wstringstream ss(text);
+        std::wstring line;
+        while (std::getline(ss, line)) if (!line.empty()) g_bd[g_bdFocus].entries.push_back({ line, false }); // one item per line
+    } else if (g_bdFocus >= 0 && g_bd[g_bdFocus].kind == BI_PHOTO) {
+        g_bd[g_bdFocus].text += text.substr(0, 60 - std::min<size_t>(60, g_bd[g_bdFocus].text.size()));
+        g_bd[g_bdFocus].cardDirty = true;
+    } else BdAddNote(text);
+    BdSaveSoon();
+    BdKick();
+}
+
+void BdType(wchar_t ch) {
+    if (g_bdFocus < 0 || g_bdFocus >= static_cast<int>(g_bd.size())) return;
+    BoardItem& it = g_bd[g_bdFocus];
+    bool back = ch == VK_BACK, enter = ch == VK_RETURN;
+    if (!back && !enter && ch < 32) return;
+    if (it.kind == BI_NOTE) {
+        if (back) { if (!it.text.empty()) it.text.pop_back(); }
+        else it.text += enter ? L'\n' : ch;
+    } else if (it.kind == BI_PHOTO) {
+        if (back) { if (!it.text.empty()) it.text.pop_back(); }
+        else if (!enter && it.text.size() < 60) it.text += ch;
+        it.cardDirty = true;
+    } else if (g_bdEditTitle) { // renaming the list
+        if (enter) { g_bdEditTitle = false; if (it.text.empty()) it.text = L"Bucket list"; }
+        else if (back) { if (!it.text.empty()) it.text.pop_back(); }
+        else if (it.text.size() < 40) it.text += ch;
+    } else {
+        if (enter) { if (!g_bdPending.empty()) { it.entries.push_back({ g_bdPending, false }); g_bdPending.clear(); } }
+        else if (back) { if (!g_bdPending.empty()) g_bdPending.pop_back(); }
+        else if (g_bdPending.size() < 120) g_bdPending += ch;
+    }
+    g_bdCaretOn = true;
+    BdSaveSoon();
+    BdKick();
+}
+
+void BdClose() {
+    if (!g_bdVisible || g_bdClosing) return;
+    if (g_bdFocus >= 0 && g_bdFocus < static_cast<int>(g_bd.size()) && g_bd[g_bdFocus].kind == BI_LIST && !g_bdPending.empty()) {
+        g_bd[g_bdFocus].entries.push_back({ g_bdPending, false }); // don't lose a half-typed item
+        g_bdPending.clear();
+    }
+    BdFocus(-1);
+    BdSave();
+    g_bdClosing = true;
+    g_bdAnimStart = GetTickCount();
+    BdKick();
+}
+
+LRESULT CALLBACK BoardProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    switch (msg) {
+    case WM_TIMER:
+        if (w == BD_SAVE_TIMER) { KillTimer(h, BD_SAVE_TIMER); BdSave(); return 0; }
+        if (w == BD_CARET_TIMER) { g_bdCaretOn = !g_bdCaretOn; BdRender(); return 0; }
+        BdRender();
+        if (GetTickCount() - g_bdAnimStart >= 240) {
+            KillTimer(h, BD_ANIM_TIMER);
+            if (g_bdClosing) { ShowWindow(h, SW_HIDE); g_bdVisible = g_bdClosing = false; }
+        }
+        return 0;
+
+    case WM_MOUSEMOVE: {
+        POINT p{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        if (g_bdMoveWin) {
+            POINT sp;
+            GetCursorPos(&sp);
+            g_bdX = sp.x - g_bdMoveOff.x;
+            g_bdY = sp.y - g_bdMoveOff.y;
+            BdRender();
+            return 0;
+        }
+        if (g_bdDrag >= 0) {
+            BoardItem& it = g_bd[g_bdDrag];
+            it.x = static_cast<float>(std::max(-it.w / 2, std::min(g_bdW - it.w / 2, static_cast<int>(p.x - g_bdDragOff.x))));
+            it.y = static_cast<float>(std::max(BD_HEAD - 10, std::min(g_bdH - 30, static_cast<int>(p.y - g_bdDragOff.y))));
+            g_bdDragMoved = true;
+            BdRender();
+            return 0;
+        }
+        int hot = -1;
+        for (int i = 0; i < 4; ++i) { RECT r = BdBtn(i); if (PtInRect(&r, p)) hot = i; }
+        if (hot != g_bdHotBtn) { g_bdHotBtn = hot; BdRender(); }
+        TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, h, 0 };
+        TrackMouseEvent(&tme);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (g_bdHotBtn >= 0) { g_bdHotBtn = -1; BdRender(); }
+        return 0;
+
+    case WM_LBUTTONDOWN: {
+        POINT p{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        for (int i = 0; i < 4; ++i) {
+            RECT r = BdBtn(i);
+            if (!PtInRect(&r, p)) continue;
+            if (i == 0) BdAddNote(L"");
+            else if (i == 1) BdAddList();
+            else if (i == 2) BdPaste();
+            else BdClose();
+            BdRender();
+            return 0;
+        }
+        if (p.y < BD_HEAD) { // the header bar moves the whole board
+            POINT sp;
+            GetCursorPos(&sp);
+            g_bdMoveWin = true;
+            g_bdMoveOff = { sp.x - g_bdX, sp.y - g_bdY };
+            SetCapture(h);
+            return 0;
+        }
+        int hit = BdHit(p);
+        if (hit < 0) { BdFocus(-1); BdRender(); return 0; }
+        // a list's tick circle: toggle without dragging
+        if (g_bd[hit].kind == BI_LIST) {
+            for (int i = 0; i < static_cast<int>(g_bd[hit].entries.size()); ++i) {
+                RECT r = BdListRow(g_bd[hit], i);
+                if (p.x >= r.left && p.x < r.left + 24 && p.y >= r.top && p.y < r.bottom) {
+                    g_bd[hit].entries[i].done = !g_bd[hit].entries[i].done;
+                    BdFocus(BdBringToFront(hit));
+                    BdSaveSoon();
+                    BdRender();
+                    return 0;
+                }
+            }
+        }
+        hit = BdBringToFront(hit);
+        BdFocus(hit);
+        if (g_bd[hit].kind == BI_LIST) // clicking a list's title renames it; anywhere else adds items
+            g_bdEditTitle = p.y < g_bd[hit].y + 46;
+        g_bdDrag = hit;
+        g_bdDragMoved = false;
+        g_bdDragOff = { p.x - static_cast<LONG>(g_bd[hit].x), p.y - static_cast<LONG>(g_bd[hit].y) };
+        SetCapture(h);
+        BdRender();
+        return 0;
+    }
+    case WM_LBUTTONUP:
+        if (g_bdMoveWin) { ReleaseCapture(); g_bdMoveWin = false; }
+        if (g_bdDrag >= 0) { ReleaseCapture(); g_bdDrag = -1; if (g_bdDragMoved) BdSaveSoon(); }
+        return 0;
+
+    case WM_RBUTTONUP: {
+        POINT p{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        int hit = BdHit(p);
+        if (hit < 0) return 0;
+        int entry = -1;
+        if (g_bd[hit].kind == BI_LIST)
+            for (int i = 0; i < static_cast<int>(g_bd[hit].entries.size()); ++i) { RECT r = BdListRow(g_bd[hit], i); if (PtInRect(&r, p)) entry = i; }
+        HMENU m = CreatePopupMenu();
+        if (entry >= 0) AppendMenuW(m, MF_STRING, 1, L"Remove this item");
+        AppendMenuW(m, MF_STRING, 2, g_bd[hit].kind == BI_PHOTO ? L"Delete photo" : g_bd[hit].kind == BI_NOTE ? L"Delete note" : L"Delete list");
+        int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, g_bdX + p.x, g_bdY + p.y, 0, h, nullptr);
+        DestroyMenu(m);
+        if (cmd == 1) { g_bd[hit].entries.erase(g_bd[hit].entries.begin() + entry); BdSaveSoon(); }
+        else if (cmd == 2) BdDelete(hit);
+        BdRender();
+        return 0;
+    }
+
+    case WM_KEYDOWN:
+        if (w == 'V' && (GetKeyState(VK_CONTROL) & 0x8000)) { BdPaste(); return 0; }
+        if (w == VK_ESCAPE) { if (g_bdFocus >= 0) { BdFocus(-1); BdRender(); } else BdClose(); }
+        return 0;
+    case WM_CHAR:
+        if (w == 22) return 0; // Ctrl+V arrives here too as ^V
+        BdType(static_cast<wchar_t>(w));
+        return 0;
+    case WM_SETCURSOR:
+        SetCursor(LoadCursor(nullptr, IDC_ARROW));
+        return TRUE;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+
+void BoardToggle() {
+    if (g_bdVisible && !g_bdClosing) {
+        if (GetForegroundWindow() == g_bdWnd) BdClose();
+        else SetForegroundWindow(g_bdWnd); // open but behind something: bring it back
+        return;
+    }
+    if (!g_bdWnd) {
+        typedef HRESULT (WINAPI *PFN_CoInitEx)(LPVOID, DWORD); // WIC, for pasted image files
+        if (auto init = reinterpret_cast<PFN_CoInitEx>(reinterpret_cast<void*>(GetProcAddress(LoadLibraryW(L"ole32.dll"), "CoInitializeEx"))))
+            init(nullptr, COINIT_APARTMENTTHREADED);
+        g_bdTitleF = InterFont(24, 700);
+        g_bdTextF = InterFont(14, 500);
+        g_bdListTitleF = InterFont(17, 700);
+        g_bdBtnF = InterFont(13, 600);
+        g_bdCapF = InterFont(15, 500);
+        g_bdHintF = InterFont(12, 500);
+        g_bdGlyphF = MakeFont(13, FW_NORMAL, L"Segoe MDL2 Assets");
+        WNDCLASSW wc{};
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpfnWndProc = BoardProc;
+        wc.lpszClassName = L"REICOBoard";
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        RegisterClassW(&wc);
+        g_bdWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW, L"REICOBoard", L"Board", WS_POPUP,
+                                  0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
+        if (!g_bdWnd) return;
+    }
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY), &mi);
+    RECT wa = mi.rcWork;
+    g_bdW = std::min(1280, static_cast<int>(wa.right - wa.left) - 120);
+    g_bdH = std::min(800, static_cast<int>(wa.bottom - wa.top) - 60);
+    g_bdX = (wa.left + wa.right) / 2 - g_bdW / 2;
+    g_bdY = (wa.top + wa.bottom) / 2 - g_bdH / 2;
+    if (!SurfCreate(g_bdS, g_bdW, g_bdH) || !SurfCreate(g_bdMask, g_bdW, g_bdH)) return;
+    if (!g_bdLoaded) BdLoad();
+    for (auto& it : g_bd) { it.cardDirty = true; BdLayout(it); }
+    BdBuildBase();
+    BdFocus(-1);
+    g_bdVisible = true;
+    g_bdClosing = false;
+    g_bdAnimStart = GetTickCount();
+    BdRender();
+    ShowWindow(g_bdWnd, SW_SHOW);
+    SetForegroundWindow(g_bdWnd);
+    BdKick();
+}
+
+void BoardShutdown() {
+    if (g_bdVisible) BdSave();
+    if (g_bdWnd) { DestroyWindow(g_bdWnd); g_bdWnd = nullptr; }
+    SurfFree(g_bdS);
+    SurfFree(g_bdMask);
+    for (HFONT* f : { &g_bdTitleF, &g_bdTextF, &g_bdListTitleF, &g_bdBtnF, &g_bdCapF, &g_bdGlyphF, &g_bdHintF })
+        if (*f) { DeleteObject(*f); *f = nullptr; }
+}
+
 // ---- input -----------------------------------------------------------------
 
 int DockHit(POINT p) {
-    if (p.y >= DOCK_TOP && p.y <= DOCK_TOP + DOCK_H && p.x >= DOCK_GAMES_X && p.x <= DOCK_GAMES_X + DOCK_H) return DH_GAMES;
-    if (p.y >= DOCK_TOP && p.y <= DOCK_TOP + DOCK_H && p.x >= DOCK_TASKMGR_X && p.x <= DOCK_TASKMGR_X + DOCK_H) return DH_TASKMGR;
+    const int sideHit[3] = { DH_GAMES, DH_TASKMGR, DH_NOTES };
+    for (int i = 0; i < 3; ++i) {
+        int bx = DockSideX(i);
+        if (bx >= 0 && p.y >= DOCK_TOP && p.y <= DOCK_TOP + DOCK_H && p.x >= bx && p.x <= bx + DOCK_H) return sideHit[i];
+    }
     const float L = g_dockS.w / 2.f - g_dockW / 2.f, R = L + g_dockW;
     if (p.y < DOCK_TOP || p.y > DOCK_TOP + DOCK_H || p.x < L || p.x > R) return DH_NONE;
     float rel = p.x - L;
@@ -6335,6 +7197,7 @@ LRESULT CALLBACK DockProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     case WM_LBUTTONUP: {
         int hit = DockHit(POINT{ GET_X_LPARAM(l), GET_Y_LPARAM(l) });
         if (hit == DH_GAMES) GameLauncherToggle();
+        else if (hit == DH_NOTES) BoardToggle();
         else if (hit == DH_TASKMGR) { AllowSetForegroundWindow(ASFW_ANY); ShellExecuteW(nullptr, L"open", L"taskmgr.exe", nullptr, nullptr, SW_SHOWNORMAL); }
         else if (hit == DH_START) SendKeys({ VK_LWIN });
         else if (hit == DH_TRAY) // glass tray pop-up right under the button
@@ -6479,6 +7342,7 @@ void DockShutdown() {
     if (g_tp) { DestroyWindow(g_tp); g_tp = nullptr; }
     SurfFree(g_tpS);
     SurfFree(g_tpMask);
+    BoardShutdown(); // saves the board
     if (g_gl) { DestroyWindow(g_gl); g_gl = nullptr; }
     SurfFree(g_glS);
     SurfFree(g_glMask);

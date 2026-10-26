@@ -4,7 +4,7 @@
 
 <h1 align="center">REICO</h1>
 <p align="center"><b>iOS-style Liquid Glass / glassmorphism desktop for Windows 10</b><br>
-Frosted, translucent, tinted glass for windows, desktop icons and the taskbar, plus a glass now-playing widget and a game launcher, all in one small app.</p>
+Frosted, translucent, tinted glass for windows, desktop icons and the taskbar, plus a glass now-playing widget, a game launcher and a photo/notes board, all in one small app.</p>
 
 <p align="center">
   <a href="../../releases/latest/download/REICO.zip"><b>⬇ Download REICO (latest)</b></a> ·
@@ -76,6 +76,16 @@ Store games launch through their own launcher, so updates and overlays keep work
 
 The button next to it opens **Task Manager**.
 
+### 📸 The board: photos, notes and bucket lists
+The third round button opens a big glass **board**, a moodboard and to-do space in one:
+- **Photos:** paste any picture with **Ctrl+V** (copied from a browser, a screenshot, or an image file in Explorer). It lands as an **Instax-style polaroid print**, tilted, with a white frame and a soft shadow. Click it and type to caption it.
+- **Notes:** **+ Note** adds a glass sticky note to type in.
+- **Bucket lists:** **+ List** adds a checklist. Type and press Enter to add things, click the circle to tick them off.
+
+Drag everything around freely and right-click to delete. Click a list's title to rename it. Drag the board's top bar to move the whole board. It all saves automatically to `C:\REICO\board`.
+
+<p align="center"><img src="docs/board.png" alt="The board: Instax photos, notes and a bucket list" width="900"></p>
+
 ### 🎵 Now playing
 When a song starts, changes or pauses, a glass card drops in at the top of the screen for 5 seconds. It shows the album art, the title and artist in glass lettering, bouncing glass beat bars, and **previous / play-pause / next** buttons. It works with any app that shows in the Windows volume flyout: Spotify, browsers and more. Hovering the card pauses its countdown.
 
@@ -87,7 +97,8 @@ Left-click REICO's tray icon to open the panel:
 - tint strength, window opacity and tint brightness
 - icon glass amount, brightness and edge softness, each with a **live preview** next to its slider
 - hover effects: **Lift / Shine / Bounce / None**
-- Extras: now-playing pop-up and glass taskbar on/off
+- Extras: now-playing pop-up, glass taskbar, and each top-left button (games, Task Manager, board) on/off
+- drag the panel's top bar to move it anywhere
 - **presets** (Red glass, Clear glass, Dark smoke, and your own)
 
 Every change applies live, and REICO's own icon recolours with your tint.
@@ -165,7 +176,7 @@ The whole app is one file, `main.cpp`. Everything else (DWM, WinRT media session
 
 ## Keywords
 
-liquid glass · iOS 26 liquid glass for Windows · glassmorphism · glass UI · frosted glass · translucent taskbar · transparent taskbar · glass dock · macOS-style dock · iPhone-style icons · tinted icons · acrylic · Windows 10 customization · Windows 10 theme · desktop customization · ricing · rice · aesthetic desktop · Rainmeter alternative · TranslucentTB alternative · now playing widget · Spotify widget · game launcher · Win32 · C++
+liquid glass · iOS 26 liquid glass for Windows · glassmorphism · glass UI · polaroid / instax photo board · moodboard · sticky notes · bucket list · to-do checklist · frosted glass · translucent taskbar · transparent taskbar · glass dock · macOS-style dock · iPhone-style icons · tinted icons · acrylic · Windows 10 customization · Windows 10 theme · desktop customization · ricing · rice · aesthetic desktop · Rainmeter alternative · TranslucentTB alternative · now playing widget · Spotify widget · game launcher · Win32 · C++
 
 ## Credits & license
 
