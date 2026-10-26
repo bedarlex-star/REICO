@@ -1,0 +1,20 @@
+# Whitelist: only the source, build files, docs and fonts are published.
+# Everything REICO writes while running (your settings, desktop layout, game
+# lists, presets, logs) and build output stays out of the repository.
+*
+!.gitignore
+!README.md
+!LICENSE
+!main.cpp
+!reico.rc
+!reico.ico
+!build.bat
+!reico_autoscale.py
+!docs/
+!docs/*.png
+!fonts/
+!fonts/Inter-Regular.ttf
+!fonts/Inter-Medium.ttf
+!fonts/Inter-SemiBold.ttf
+!fonts/Inter-Bold.ttf
+!fonts/Inter-LICENSE.txt

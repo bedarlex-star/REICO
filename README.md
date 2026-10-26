@@ -1,0 +1,173 @@
+<p align="center">
+  <img src="docs/panel.png" alt="REICO glass panel" width="720">
+</p>
+
+<h1 align="center">REICO</h1>
+<p align="center"><b>iOS-style Liquid Glass / glassmorphism desktop for Windows 10</b><br>
+Frosted, translucent, tinted glass for windows, desktop icons and the taskbar, plus a glass now-playing widget and a game launcher, all in one small app.</p>
+
+<p align="center">
+  <a href="../../releases/latest/download/REICO.zip"><b>⬇ Download REICO (latest)</b></a> ·
+  <a href="../../releases/latest">All releases</a>
+</p>
+
+---
+
+REICO brings Apple's **Liquid Glass** look from **iOS 26** and macOS to Windows: a full **glassmorphism** desktop theme. Everything becomes translucent, tinted **frosted glass** with a bright rim of light and a soft gloss, in a single colour of your choice: File Explorer windows, desktop icons, a **translucent glass taskbar / dock**, the tray, the calendar, a now-playing music widget and a game launcher. If you're **ricing** Windows 10 and want an iPhone-like glass UI, this does it in one app. It is one small native program (about 2 MB, plain Win32 + C++), uses around **50 MB of RAM**, and sits at **~0% CPU** when idle.
+
+> **Windows 10 (64-bit).** Windows 11 hasn't been tested.
+
+## Contents
+
+- [Features](#features)
+- [Install](#install)
+- [Using REICO](#using-reico)
+- [Settings](#settings-glasstxt)
+- [Build from source](#build-from-source)
+- [Uninstall](#uninstall)
+- [Good to know](#good-to-know)
+- [Credits & license](#credits--license)
+
+## Features
+
+### 🪟 Liquid-glass windows
+File Explorer windows (or any window type you choose) become clear, tinted glass with a light rim and gloss. The tint is cut exactly to the window's edge, with no colour bleeding past it. Turn it on or off any time with **Ctrl+Shift+F6**.
+
+### 🧊 Glass desktop icons
+Your desktop icons are redrawn as glass in your tint: a frosted body, a specular edge, a darker thickness edge and a top gloss. A slider controls how much glass versus the original icon you see. Icons can be moved and resized, and the layout is saved.
+
+<p align="center"><img src="docs/icons.png" alt="Glass desktop icons" width="720"></p>
+
+### 📌 Glass taskbar (dock)
+A rounded glass bar centred at the top of the screen replaces the Windows taskbar. It has:
+- **Start**
+- your **pinned** and **open apps**, grouped by app, with a glass pill under the active one and a shine sweep on hover
+- a **tray** button
+- a **clock**
+
+Maximized windows stop below it, and it hides itself for fullscreen games and videos. While it's on, the Windows taskbar is hidden. Your original taskbar setting is restored when you turn the dock off or close REICO.
+
+<p align="center"><img src="docs/dock.png" alt="Glass dock" width="900"></p>
+
+<table>
+<tr>
+<td align="center"><img src="docs/tray.png" alt="Glass tray" width="300"><br><b>Tray</b><br>All your tray icons, each shown once. Left- and right-clicks reach the app exactly like the real tray.</td>
+<td align="center"><img src="docs/calendar.png" alt="Glass calendar" width="290"><br><b>Calendar</b><br>A live clock with seconds and a month view. Use the arrows, the mouse wheel or ← → to change month.</td>
+</tr>
+</table>
+
+### 🎮 Game launcher
+The round **controller** button at the top-left opens a glass grid of your games:
+- **Finds games from:**
+  - **Steam** (all library folders)
+  - **Epic Games**
+  - **Riot** (VALORANT, League, on any drive)
+  - **GOG**
+  - **`Games` folders** on every drive
+  - the **EA, Ubisoft and Rockstar** install folders
+- **⟳** re-scans. Nothing scans automatically.
+- **＋** adds any game exe the scan missed.
+- **Right-click** a game to remove it.
+- **Typing** searches, and **Enter** launches the top match.
+
+Store games launch through their own launcher, so updates and overlays keep working.
+
+<p align="center"><img src="docs/games.png" alt="Game launcher" width="470"></p>
+
+The button next to it opens **Task Manager**.
+
+### 🎵 Now playing
+When a song starts, changes or pauses, a glass card drops in at the top of the screen for 5 seconds. It shows the album art, the title and artist in glass lettering, bouncing glass beat bars, and **previous / play-pause / next** buttons. It works with any app that shows in the Windows volume flyout: Spotify, browsers and more. Hovering the card pauses its countdown.
+
+<p align="center"><img src="docs/nowplaying.png" alt="Now playing" width="520"></p>
+
+### 🎛️ The glass panel
+Left-click REICO's tray icon to open the panel:
+- tint **colour wheel** and colour swatches
+- tint strength, window opacity and tint brightness
+- icon glass amount, brightness and edge softness, each with a **live preview** next to its slider
+- hover effects: **Lift / Shine / Bounce / None**
+- Extras: now-playing pop-up and glass taskbar on/off
+- **presets** (Red glass, Clear glass, Dark smoke, and your own)
+
+Every change applies live, and REICO's own icon recolours with your tint.
+
+## Install
+
+1. **[Download REICO.zip](../../releases/latest/download/REICO.zip)**.
+2. Extract it to **`C:\REICO`**. REICO keeps its settings there, so the folder name matters. You should end up with `C:\REICO\REICO.exe` and `C:\REICO\fonts\`.
+3. Run **`REICO.exe`**.
+
+That's it. REICO starts with Windows from then on. Its settings files are created automatically on first run.
+
+> Windows SmartScreen may warn about an unrecognised app, because the exe isn't code-signed. Choose **More info → Run anyway**, or [build it yourself](#build-from-source).
+
+## Using REICO
+
+| Where | What |
+|---|---|
+| Tray icon — **left-click** | Glass panel (all settings) |
+| Tray icon — **right-click** | Menu: settings, presets, glass on/off, edit icon layout, rescan, open `glass.txt`, exit |
+| Dock — **click an app** | Open it, switch to it, or minimize it if it's already in front |
+| Dock — **middle-click / right-click** | New window / menu (new window, close) |
+| Desktop icon — **double-click** | Launch it |
+| **F2** (desktop focused) / panel → *Edit layout* | Edit mode: drag icons to move them, drag the corner handle to resize |
+| **Ctrl+Shift+F5** | Rescan the desktop icons |
+| **Ctrl+Shift+F6** | Window glass on/off |
+
+## Settings (`glass.txt`)
+
+Everything in the panel is stored in `C:\REICO\glass.txt`. You can also edit it in Notepad; REICO picks up changes within a second.
+
+| Setting | Meaning |
+|---|---|
+| `tint=R,G,B` | Glass colour |
+| `tintAlpha` | Tint strength, 0–255 |
+| `windowAlpha` | Window opacity, 80–255 |
+| `liquid` | 1 = liquid glass, 0 = classic blur/acrylic (`mode=blur` or `acrylic`) |
+| `radius` | Rounded corners in px. **Keep 0 on Windows 10**: Windows draws Explorer's title bar square |
+| `iconGlass`, `iconGlassAmount` | Glass icons on/off, and % glass vs. the original icon |
+| `iconTint`, `iconBrightness`, `iconEdgeBlur` | Tint icons, their brightness, and edge softness |
+| `hoverEffect` | `lift`, `shine`, `bounce` or `none` |
+| `nowPlaying` | Now-playing pop-up on/off |
+| `dock` | Glass taskbar on/off |
+| `class=` | Which window types get glass (one per line). Default `CabinetWClass` = File Explorer |
+
+Presets are copies of `glass.txt` in `C:\REICO\presets\`. Applying a preset only changes the settings it contains.
+
+## Build from source
+
+You need [MSYS2](https://www.msys2.org/) with the UCRT64 GCC toolchain (`pacman -S mingw-w64-ucrt-x86_64-gcc`). Then, in an MSYS2 UCRT64 shell:
+
+```bash
+cd /c/REICO
+windres reico.rc -O coff -o reico.res
+g++ main.cpp reico.res -municode -mwindows -O2 -s -static -o REICO.exe -lshell32
+```
+
+Or double-click `build.bat`. The result is a single, fully static `REICO.exe`.
+
+The whole app is one file, `main.cpp`. Everything else (DWM, WinRT media session, comctl32, comdlg32 and so on) is loaded at runtime, so no extra libraries are needed.
+
+## Uninstall
+
+1. Right-click the REICO tray icon → **Exit REICO**. This also restores the Windows taskbar.
+2. Task Manager → **Startup** → disable **REICO**, or delete `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\REICO`.
+3. Delete `C:\REICO`.
+
+## Good to know
+
+- **Antivirus:** to show your tray icons in its glass tray, REICO reads the icon list from Explorer's tray, the same way tray tools have always done it. Together with being unsigned, a few antivirus programs may flag it. The full source is here if you want to check, or build it yourself.
+- **Built for Windows 10.** The glass on windows uses an undocumented Windows API that many tools use. It could change in future Windows updates.
+- The dock shows on the main monitor.
+- Apps that draw their own title bar (e.g. Chrome) keep their own look.
+- **Blender bonus:** `reico_autoscale.py` is a small Blender add-on that scales Blender's UI with its window size. Install it in Blender via *Preferences → Add-ons → Install from Disk*.
+
+## Keywords
+
+liquid glass · iOS 26 liquid glass for Windows · glassmorphism · glass UI · frosted glass · translucent taskbar · transparent taskbar · glass dock · macOS-style dock · iPhone-style icons · tinted icons · acrylic · Windows 10 customization · Windows 10 theme · desktop customization · ricing · rice · aesthetic desktop · Rainmeter alternative · TranslucentTB alternative · now playing widget · Spotify widget · game launcher · Win32 · C++
+
+## Credits & license
+
+- UI font: [Inter](https://rsms.me/inter/) by Rasmus Andersson, SIL Open Font License (see `fonts/Inter-LICENSE.txt`).
+- REICO is released under the MIT License (see `LICENSE`).
