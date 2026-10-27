@@ -18,3 +18,6 @@
 !fonts/Inter-SemiBold.ttf
 !fonts/Inter-Bold.ttf
 !fonts/Inter-LICENSE.txt
+!extension/
+!extension/manifest.json
+!extension/background.js

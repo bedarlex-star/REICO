@@ -4,7 +4,7 @@
 
 <h1 align="center">REICO</h1>
 <p align="center"><b>iOS-style Liquid Glass / glassmorphism desktop for Windows 10</b><br>
-Frosted, translucent, tinted glass for windows, desktop icons and the taskbar, plus a glass now-playing widget, a game launcher and a photo/notes board, all in one small app.</p>
+Frosted, translucent, tinted glass for windows, desktop icons and the taskbar, plus a glass now-playing widget, a game launcher, a photo/notes board and a fast multi-connection download manager, all in one small app.</p>
 
 <p align="center">
   <a href="../../releases/latest/download/REICO.zip"><b>⬇ Download REICO (latest)</b></a> ·
@@ -86,6 +86,22 @@ Drag everything around freely and right-click to delete. Click a list's title to
 
 <p align="center"><img src="docs/board.png" alt="The board: Instax photos, notes and a bucket list" width="900"></p>
 
+### ⚡ Download manager (faster browser downloads)
+A built-in **download accelerator**, in the spirit of IDM, for **Chrome, Edge and Brave**. With the small **REICO Downloads** extension installed (see [Install](#install)), every download you start in the browser goes to REICO instead:
+- A glass card asks **where to save it**, with **Change** to pick a folder and **Download / Cancel** to confirm. The download **already starts in the background** while the card waits, so no time is lost.
+- It downloads with **8 connections at once** using HTTP byte ranges. Many servers and CDNs cap the speed of each connection, and one connection rarely fills a fast line, so several in parallel add up.
+- **Dynamic splitting**, as IDM does it: when a connection finishes its part, it takes over the second half of the biggest part still left. There's no slow tail at the end, and the progress bar shows every connection's part filling in.
+- **Self-healing:** a connection that stalls or drops resumes from the exact byte it stopped at. If a server refuses extra connections (HTTP 429/503), REICO simply uses fewer, and connections are kept alive between parts.
+- It sends your browser cookies, referrer and user agent along, so downloads that need you to be logged in still work.
+- Files download as `name.reico-part` and only get their real name once complete. Cancelled or failed downloads delete themselves, even if REICO is closed mid-way.
+- When it's done: **Open** or **Show in folder**.
+
+In a local test where each connection was capped at 3 MB/s (as many CDNs do), a 60 MB file took **20 s** as a normal single-connection download and **2.9 s** with REICO, about **7× faster**. How much faster it is for you depends on the server: on a server that doesn't limit connections and a line that is already full, it can't go faster than your internet.
+
+Files under 1 MB, private/incognito windows and `blob:` downloads stay with the browser. Turn the whole thing off in the panel (**Download manager**), and the browser downloads normally again.
+
+<p align="center"><img src="docs/downloads.png" alt="REICO download manager: save prompt, multi-connection progress, done" width="470"></p>
+
 ### 🎵 Now playing
 When a song starts, changes or pauses, a glass card drops in at the top of the screen for 5 seconds. It shows the album art, the title and artist in glass lettering, bouncing glass beat bars, and **previous / play-pause / next** buttons. It works with any app that shows in the Windows volume flyout: Spotify, browsers and more. Hovering the card pauses its countdown.
 
@@ -97,7 +113,7 @@ Left-click REICO's tray icon to open the panel:
 - tint strength, window opacity and tint brightness
 - icon glass amount, brightness and edge softness, each with a **live preview** next to its slider
 - hover effects: **Lift / Shine / Bounce / None**
-- Extras: now-playing pop-up, glass taskbar, and each top-left button (games, Task Manager, board) on/off
+- Extras: now-playing pop-up, glass taskbar, each top-left button (games, Task Manager, board) and the download manager on/off
 - drag the panel's top bar to move it anywhere
 - **presets** (Red glass, Clear glass, Dark smoke, and your own)
 
@@ -110,6 +126,13 @@ Every change applies live, and REICO's own icon recolours with your tint.
 3. Run **`REICO.exe`**.
 
 That's it. REICO starts with Windows from then on. Its settings files are created automatically on first run.
+
+**For the download manager** (optional, Chrome / Edge / Brave):
+
+4. Open `chrome://extensions` (Edge: `edge://extensions`, Brave: `brave://extensions`).
+5. Turn on **Developer mode**, click **Load unpacked** and choose **`C:\REICO\extension`**.
+
+REICO registers itself with the browser when it starts, so run REICO at least once first. Firefox isn't supported.
 
 > Windows SmartScreen may warn about an unrecognised app, because the exe isn't code-signed. Choose **More info → Run anyway**, or [build it yourself](#build-from-source).
 
@@ -142,6 +165,7 @@ Everything in the panel is stored in `C:\REICO\glass.txt`. You can also edit it 
 | `hoverEffect` | `lift`, `shine`, `bounce` or `none` |
 | `nowPlaying` | Now-playing pop-up on/off |
 | `dock` | Glass taskbar on/off |
+| `downloads` | Download manager on/off (1 = REICO takes browser downloads) |
 | `class=` | Which window types get glass (one per line). Default `CabinetWClass` = File Explorer |
 
 Presets are copies of `glass.txt` in `C:\REICO\presets\`. Applying a preset only changes the settings it contains.
@@ -153,18 +177,19 @@ You need [MSYS2](https://www.msys2.org/) with the UCRT64 GCC toolchain (`pacman 
 ```bash
 cd /c/REICO
 windres reico.rc -O coff -o reico.res
-g++ main.cpp reico.res -municode -mwindows -O2 -s -static -o REICO.exe -lshell32
+g++ main.cpp reico.res -municode -mwindows -O2 -s -static -o REICO.exe -lshell32 -lwinhttp
 ```
 
 Or double-click `build.bat`. The result is a single, fully static `REICO.exe`.
 
-The whole app is one file, `main.cpp`. Everything else (DWM, WinRT media session, comctl32, comdlg32 and so on) is loaded at runtime, so no extra libraries are needed.
+The whole app is one file, `main.cpp`, plus the browser extension in `extension/`. Apart from WinHTTP (for the download manager), everything (DWM, WinRT media session, comctl32, comdlg32 and so on) is loaded at runtime, so no extra libraries are needed.
 
 ## Uninstall
 
 1. Right-click the REICO tray icon → **Exit REICO**. This also restores the Windows taskbar.
 2. Task Manager → **Startup** → disable **REICO**, or delete `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\REICO`.
-3. Delete `C:\REICO`.
+3. If you added the extension: remove **REICO Downloads** from your browser's extensions page, and delete the `com.reico.downloads` keys under `HKCU\Software\Google\Chrome\NativeMessagingHosts`, `HKCU\Software\Microsoft\Edge\NativeMessagingHosts` and `HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts`.
+4. Delete `C:\REICO`.
 
 ## Good to know
 
@@ -176,7 +201,7 @@ The whole app is one file, `main.cpp`. Everything else (DWM, WinRT media session
 
 ## Keywords
 
-liquid glass · iOS 26 liquid glass for Windows · glassmorphism · glass UI · polaroid / instax photo board · moodboard · sticky notes · bucket list · to-do checklist · frosted glass · translucent taskbar · transparent taskbar · glass dock · macOS-style dock · iPhone-style icons · tinted icons · acrylic · Windows 10 customization · Windows 10 theme · desktop customization · ricing · rice · aesthetic desktop · Rainmeter alternative · TranslucentTB alternative · now playing widget · Spotify widget · game launcher · Win32 · C++
+liquid glass · iOS 26 liquid glass for Windows · glassmorphism · glass UI · polaroid / instax photo board · moodboard · sticky notes · bucket list · to-do checklist · frosted glass · translucent taskbar · transparent taskbar · glass dock · macOS-style dock · iPhone-style icons · tinted icons · acrylic · Windows 10 customization · Windows 10 theme · desktop customization · ricing · rice · aesthetic desktop · Rainmeter alternative · TranslucentTB alternative · now playing widget · Spotify widget · game launcher · download manager · download accelerator · IDM alternative · Internet Download Manager alternative · multi-connection downloader · segmented download · Chrome download manager · Win32 · C++
 
 ## Credits & license
 

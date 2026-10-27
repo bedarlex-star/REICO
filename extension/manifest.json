@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "REICO Downloads",
+  "version": "1.0",
+  "description": "Hands your downloads to REICO's fast multi-connection downloader.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArAMyfqWwTV4QO9/OIMFObNAHV9mW93enBnQtJfwScJx2RX9S8m4vqLia9id1UT767bH7Ym8BLcG+l2EVb20E/jzPSvvcnkx0nkxqkip+Vg4LSRlYvjl0obOd5nyPGOtFw4lHKe5m6t7fZGLrUavyje4uKlB3qYwELydx9ugSJvk1+t34w/Q6wk8azy430oy+UsW9IPZPDmXBHshB/u+5+gIbKrOQ/mhvTIi7nDpMJRKfCFFxpvIL5y6JtGAq0+XzBR8L8CjKq8iMVHUB3yQT3GMDbr+Co3vKTQLoZiqEmZCtU5QaAb1buqryuHOQF+23p9swpskvgLaYMg2+7OqqowIDAQAB",
+  "permissions": ["downloads", "nativeMessaging", "cookies"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" }
+}

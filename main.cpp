@@ -13,9 +13,11 @@
 #include <commoncontrols.h>   // IImageList / SHGetImageList (jumbo 256x256 icons)
 #include <commctrl.h>         // trackbar/combobox constants (comctl32 itself is loaded at runtime)
 #include <inspectable.h>      // IInspectable/HSTRING for the now-playing media session (WinRT)
-#include <wincodec.h>         // WIC, to decode album art
+#include <wincodec.h>
+#include <winhttp.h>          // the download manager         // WIC, to decode album art
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -1227,6 +1229,7 @@ struct GlassConfig {
     bool nowPlaying = true;             // liquid-glass pop-up when a song starts / stops
     bool dock = false;                  // REICO's glass taskbar at the top (Windows' taskbar auto-hides)
     bool btnGames = true, btnTaskMgr = true, btnNotes = true; // the round buttons at the top-left
+    bool downloads = true;              // take browser downloads (REICO Downloads extension)
     std::vector<std::wstring> classes{ L"CabinetWClass" }; // cmd is NOT default: too heavy
 };
 
@@ -1331,6 +1334,9 @@ void LoadGlassConfig() {
                "btnGames=1\n"
                "btnTaskMgr=1\n"
                "btnNotes=1\n"
+               "# downloads: 1 = REICO's multi-connection download manager takes browser downloads\n"
+               "# (needs the REICO Downloads extension from C:\\REICO\\extension)\n"
+               "downloads=1\n"
                "# one class= line per window type to affect\n"
                "class=CabinetWClass\n"
                "# cmd (ConsoleWindowClass) is heavy with blur - not enabled by default.\n"
@@ -1398,6 +1404,8 @@ void LoadGlassConfig() {
             g_glassCfg.btnTaskMgr = std::atoi(val.c_str()) != 0;
         } else if (key == "btnNotes") {
             g_glassCfg.btnNotes = std::atoi(val.c_str()) != 0;
+        } else if (key == "downloads") {
+            g_glassCfg.downloads = std::atoi(val.c_str()) != 0;
         } else if (key == "nowPlaying") {
             g_glassCfg.nowPlaying = std::atoi(val.c_str()) != 0;
         } else if (key == "hoverEffect") {
@@ -3055,7 +3063,7 @@ enum PanelCtlKind { CK_ACTION, CK_TOGGLE, CK_SLIDER, CK_SWATCH, CK_SEGMENT, CK_C
 enum {
     P_REFRESH = 1, P_EDIT, P_GLASS, P_LIQUID, P_ICONGLASS, P_ICONTINT,
     P_TINTA, P_WALPHA, P_GLASSAMT, P_BRIGHT, P_EDGE, P_HOVER, P_SETTINGS, P_EXIT, P_NOWPLAY, P_DOCK, P_BTNGAMES, P_BTNTASK, P_BTNNOTES,
-    P_WHEEL, P_TINTV,
+    P_DOWNLOADS, P_WHEEL, P_TINTV,
     P_SWATCH = 100, P_PRESET = 200,
 };
 
@@ -3070,7 +3078,7 @@ struct PanelCtl {
 };
 
 struct PanelVals {
-    bool liquid, iconGlass, iconTint, nowPlaying, dock, btnGames, btnTaskMgr, btnNotes;
+    bool liquid, iconGlass, iconTint, nowPlaying, dock, btnGames, btnTaskMgr, btnNotes, downloads;
     int tintA, wAlpha, glassAmt, bright, edge, hover;
     COLORREF tint;
     float hue, sat;  // tint as hue (0..360) + saturation (0..1), for the colour wheel
@@ -3134,6 +3142,7 @@ void PanelLoadVals() {
     g_pv.btnGames = g_glassCfg.btnGames;
     g_pv.btnTaskMgr = g_glassCfg.btnTaskMgr;
     g_pv.btnNotes = g_glassCfg.btnNotes;
+    g_pv.downloads = g_glassCfg.downloads;
     g_pv.tintA = g_glassCfg.tintAlpha;
     g_pv.wAlpha = g_glassCfg.windowAlpha;
     g_pv.glassAmt = g_glassCfg.iconGlassAmount;
@@ -3168,6 +3177,7 @@ bool* PanelToggleVal(int id) {
     case P_BTNGAMES: return &g_pv.btnGames;
     case P_BTNTASK: return &g_pv.btnTaskMgr;
     case P_BTNNOTES: return &g_pv.btnNotes;
+    case P_DOWNLOADS: return &g_pv.downloads;
     }
     return nullptr;
 }
@@ -3191,6 +3201,7 @@ void PanelApply() {
         { "btnGames", b(g_pv.btnGames) },
         { "btnTaskMgr", b(g_pv.btnTaskMgr) },
         { "btnNotes", b(g_pv.btnNotes) },
+        { "downloads", b(g_pv.downloads) },
     });
     ReloadConfig();
     UiFromConfig();
@@ -3250,7 +3261,8 @@ void PanelLayout() {
     add(CK_TOGGLE, P_DOCK, { L2, y, R2, y + 28 }, L"Glass taskbar (top)"); y += 32;
     add(CK_TOGGLE, P_BTNGAMES, { L2, y, R2, y + 28 }, L"Game launcher button"); y += 32;
     add(CK_TOGGLE, P_BTNTASK, { L2, y, R2, y + 28 }, L"Task Manager button"); y += 32;
-    add(CK_TOGGLE, P_BTNNOTES, { L2, y, R2, y + 28 }, L"Board button"); y += 34 + 10;
+    add(CK_TOGGLE, P_BTNNOTES, { L2, y, R2, y + 28 }, L"Board button"); y += 32;
+    add(CK_TOGGLE, P_DOWNLOADS, { L2, y, R2, y + 28 }, L"Download manager"); y += 34 + 10;
 
     add(CK_SECTION, 0, { L2, y, R2, y + 16 }, L"PRESETS"); y += 22;
     g_pnlPresets = ListPresets();
@@ -7060,6 +7072,901 @@ void BoardShutdown() {
 
 // ---- input -----------------------------------------------------------------
 
+// ---- download manager: fast multi-connection downloads from the browser -------
+//
+// The REICO Downloads extension (C:\REICO\extension) offers every browser download to
+// REICO through native messaging: Chrome/Edge/Brave start "REICO.exe chrome-extension://..."
+// with the download as JSON on stdin. That short-lived process (DlHostMain) hands it to
+// the running REICO (WM_COPYDATA to the tray window) and answers {"ok":true} - REICO took
+// it and the browser cancels its own download - or {"ok":false}, and the browser
+// downloads it as usual (REICO not running, download manager turned off).
+//
+// What makes it faster than the browser:
+//  - several connections at once (HTTP byte ranges): servers and CDNs often cap the speed
+//    of each connection, and one TCP connection rarely fills a fast or far-away link;
+//  - dynamic splitting, like IDM: a connection that finishes its part takes over the
+//    second half of the biggest part still left, so there's no slow tail at the end;
+//  - it starts downloading the moment it's caught, while the "where to save" card waits;
+//  - a part that stalls or drops is retried from the exact byte it stopped at, a server
+//    that refuses extra connections just gets fewer, and connections are kept alive;
+//  - the file is sparse while downloading, so writing far into it doesn't make Windows
+//    zero-fill everything before that point first.
+// The file downloads as "<name>.reico-part" and is deleted automatically if REICO is
+// closed or the download fails (delete-on-close), so nothing half-done is left behind.
+
+const ULONG_PTR DL_COPYDATA_ID = 0x52454443;     // 'REDC'
+const wchar_t* DL_EXT_ID = L"hnocgodkmndlcgkpebfpaibkhdocnijc"; // fixed by the "key" in extension/manifest.json
+const wchar_t* DL_HOST_JSON = L"C:\\REICO\\reico_host.json";
+const wchar_t* DL_DIR_TXT = L"C:\\REICO\\downloads.txt";
+const int DL_CONNS = 8;                          // connections per download
+const long long DL_MIN_SPLIT = 1 << 20;          // never split a part below 2 x 1 MB
+enum { DS_RUN, DS_DONE, DS_FAIL, DS_CANCEL };
+
+struct DlSeg { long long start, pos, end, reqEnd; bool owned; }; // [pos, end) still to fetch; reqEnd = end of its open request
+struct Download {
+    std::wstring url, referrer, cookies, ua;      // the request (worker threads)
+    std::wstring host, object;                    // cracked url
+    INTERNET_PORT port = 0;
+    bool https = false;
+    HINTERNET session = nullptr, conn = nullptr;
+    CRITICAL_SECTION cs;                          // guards name, part, error, segs, file
+    std::wstring name, part, error;
+    std::vector<DlSeg> segs;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    std::atomic<long long> size{ 0 }, got{ 0 };
+    std::atomic<int> state{ DS_RUN }, threads{ 0 }, conns{ 0 };
+    std::atomic<bool> ranges{ false };
+    std::atomic<DWORD> doneAt{ 0 };
+    // UI thread only
+    std::wstring dir, partDir, final;             // chosen folder, folder of the .reico-part, finished file
+    bool confirmed = false, moving = false;
+    std::atomic<bool> moved{ false };             // set by DlMover; `final` is valid once it's true
+    DWORD born = 0, savedAt = 0;
+    DWORD sampleT[32] = {}; long long sampleB[32] = {}; int samples = 0;
+    double speed = 0;
+};
+
+HWND g_dlWnd = nullptr;
+Surface g_dlS, g_dlMask;
+std::vector<Download*> g_dls, g_dlGone;  // cards on screen (oldest first) / dismissed, freed once their threads stop
+std::wstring g_dlDir;                    // default folder (downloads.txt, else the user's Downloads)
+HFONT g_dlNameF = nullptr, g_dlSmallF = nullptr, g_dlBtnF = nullptr, g_dlGlyphF = nullptr;
+enum { DA_GO = 1, DA_CANCEL, DA_FOLDER, DA_OPEN, DA_SHOW, DA_CLOSE, DA_RETRY };
+struct DlHit { RECT r; Download* d; int act; };
+std::vector<DlHit> g_dlHits;
+DlHit g_dlHot{}, g_dlPressed{};
+bool g_dlHover = false;
+POINT g_dlPos{};
+const UINT_PTR DL_TIMER = 1;
+const int DL_W = 430, DL_ASK_H = 170, DL_CARD_H = 104, DL_GAP = 10, DL_MAX_CARDS = 5;
+
+// -- small helpers --
+
+std::wstring DlWide(const std::string& s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), &w[0], n);
+    return w;
+}
+
+void DlPutUtf8(std::string& out, unsigned u) {
+    if (u < 0x80) out += static_cast<char>(u);
+    else if (u < 0x800) { out += static_cast<char>(0xC0 | (u >> 6)); out += static_cast<char>(0x80 | (u & 63)); }
+    else if (u < 0x10000) { out += static_cast<char>(0xE0 | (u >> 12)); out += static_cast<char>(0x80 | ((u >> 6) & 63)); out += static_cast<char>(0x80 | (u & 63)); }
+    else { out += static_cast<char>(0xF0 | (u >> 18)); out += static_cast<char>(0x80 | ((u >> 12) & 63));
+           out += static_cast<char>(0x80 | ((u >> 6) & 63)); out += static_cast<char>(0x80 | (u & 63)); }
+}
+
+// A string field of the flat JSON object the extension sends.
+std::wstring DlJsonStr(const std::string& j, const char* key) {
+    std::string pat = std::string("\"") + key + "\"";
+    size_t p = j.find(pat);
+    if (p == std::string::npos) return L"";
+    p = j.find_first_not_of(" \t\r\n", p + pat.size());
+    if (p == std::string::npos || j[p] != ':') return L"";
+    p = j.find_first_not_of(" \t\r\n", p + 1);
+    if (p == std::string::npos || j[p] != '"') return L"";
+    std::string out;
+    for (++p; p < j.size() && j[p] != '"'; ++p) {
+        if (j[p] != '\\') { out += j[p]; continue; }
+        if (++p >= j.size()) break;
+        switch (j[p]) {
+        case 'n': out += '\n'; break;
+        case 't': out += '\t'; break;
+        case 'r': out += '\r'; break;
+        case 'b': case 'f': break;
+        case 'u': {
+            if (p + 4 >= j.size()) return L"";
+            unsigned u = std::strtoul(j.substr(p + 1, 4).c_str(), nullptr, 16);
+            p += 4;
+            if (u >= 0xD800 && u < 0xDC00 && p + 6 < j.size() && j[p + 1] == '\\' && j[p + 2] == 'u') { // surrogate pair
+                unsigned lo = std::strtoul(j.substr(p + 3, 4).c_str(), nullptr, 16);
+                if (lo >= 0xDC00 && lo < 0xE000) { u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00); p += 6; }
+            }
+            DlPutUtf8(out, u);
+            break;
+        }
+        default: out += j[p];
+        }
+    }
+    return DlWide(out);
+}
+
+long long DlJsonNum(const std::string& j, const char* key) {
+    size_t p = j.find(std::string("\"") + key + "\"");
+    if (p == std::string::npos || (p = j.find(':', p)) == std::string::npos) return 0;
+    return std::max(0LL, std::atoll(j.c_str() + p + 1));
+}
+
+// Header values come from the browser: no control characters (no header injection).
+std::wstring DlHeaderSafe(std::wstring s) {
+    s.erase(std::remove_if(s.begin(), s.end(), [](wchar_t c) { return c < 32; }), s.end());
+    return s.substr(0, 16384);
+}
+
+// "%E2%9C%93.zip" -> "✓.zip"
+std::wstring DlPercentDecode(const std::wstring& s) {
+    std::string b;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == L'%' && i + 2 < s.size() && iswxdigit(s[i + 1]) && iswxdigit(s[i + 2])) {
+            b += static_cast<char>(std::wcstoul(s.substr(i + 1, 2).c_str(), nullptr, 16));
+            i += 2;
+        } else {
+            DlPutUtf8(b, s[i]);
+        }
+    }
+    return DlWide(b);
+}
+
+std::wstring DlCleanName(std::wstring n) {
+    for (auto& c : n) if (c < 32 || wcschr(L"\\/:*?\"<>|", c)) c = L'_';
+    while (!n.empty() && (n.back() == L'.' || n.back() == L' ')) n.pop_back();
+    while (!n.empty() && n.front() == L' ') n.erase(0, 1);
+    if (n.size() > 150) {
+        std::wstring ext = fs::path(n).extension().wstring();
+        if (ext.size() > 12) ext.clear();
+        n = n.substr(0, 150 - ext.size()) + ext;
+    }
+    return n.empty() ? L"download" : n;
+}
+
+// dir\name, or dir\name (2).ext ... if that's taken
+std::wstring DlUnique(const std::wstring& dir, const std::wstring& name, const wchar_t* suffix = L"") {
+    fs::path p(name);
+    std::wstring stem = p.stem().wstring(), ext = p.extension().wstring();
+    for (int i = 1; i < 1000; ++i) {
+        std::wstring f = dir + L"\\" + (i == 1 ? name : stem + L" (" + std::to_wstring(i) + L")" + ext) + suffix;
+        if (GetFileAttributesW(f.c_str()) == INVALID_FILE_ATTRIBUTES) return f;
+    }
+    return dir + L"\\" + name + suffix;
+}
+
+std::wstring DlBytes(double b) {
+    wchar_t s[32];
+    if (b < 1024) swprintf(s, 32, L"%.0f B", b);
+    else if (b < 1024 * 1024) swprintf(s, 32, L"%.0f KB", b / 1024);
+    else if (b < 1024.0 * 1024 * 1024) swprintf(s, 32, L"%.1f MB", b / (1024 * 1024));
+    else swprintf(s, 32, L"%.2f GB", b / (1024.0 * 1024 * 1024));
+    return s;
+}
+
+std::wstring DlTime(long long sec) {
+    wchar_t s[32];
+    if (sec < 60) swprintf(s, 32, L"%lld s", sec);
+    else if (sec < 3600) swprintf(s, 32, L"%lld min %lld s", sec / 60, sec % 60);
+    else swprintf(s, 32, L"%lld h %lld min", sec / 3600, sec % 3600 / 60);
+    return s;
+}
+
+// -- the default folder --
+
+void DlLoadDir() {
+    std::wstring t = ReadTextFile(DL_DIR_TXT);
+    while (!t.empty() && iswspace(t.back())) t.pop_back();
+    if (!t.empty() && GetFileAttributesW(t.c_str()) != INVALID_FILE_ATTRIBUTES) { g_dlDir = t; return; }
+    static const GUID kDownloads = { 0x374DE290, 0x123F, 0x4565, { 0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B } };
+    typedef void (WINAPI *PFN_Free)(LPVOID);
+    auto coFree = reinterpret_cast<PFN_Free>(reinterpret_cast<void*>(GetProcAddress(LoadLibraryW(L"ole32.dll"), "CoTaskMemFree")));
+    PWSTR p = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(kDownloads, 0, nullptr, &p)) && p) {
+        g_dlDir = p;
+        if (coFree) coFree(p);
+    } else {
+        wchar_t prof[MAX_PATH];
+        g_dlDir = GetEnvironmentVariableW(L"USERPROFILE", prof, MAX_PATH) ? std::wstring(prof) + L"\\Downloads" : L"C:\\";
+    }
+}
+
+bool DlPickFolder(std::wstring& dir) {
+    static const CLSID kFileOpenDialog = { 0xDC1C5A9C, 0xE88A, 0x4DDE, { 0xA5, 0xA1, 0x60, 0xF8, 0x2A, 0x20, 0xAE, 0xF7 } };
+    static const IID kIFileOpenDialog = { 0xD57C7288, 0xD4AD, 0x4768, { 0xBE, 0x02, 0x9D, 0x96, 0x95, 0x32, 0xD9, 0x60 } };
+    static const IID kIShellItem = { 0x43826D1E, 0xE718, 0x42EE, { 0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B, 0xFE } };
+    typedef HRESULT (WINAPI *PFN_CoInitEx)(LPVOID, DWORD);
+    typedef HRESULT (WINAPI *PFN_CoCreate)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
+    typedef void (WINAPI *PFN_Free)(LPVOID);
+    HMODULE ole = LoadLibraryW(L"ole32.dll");
+    auto init = reinterpret_cast<PFN_CoInitEx>(reinterpret_cast<void*>(GetProcAddress(ole, "CoInitializeEx")));
+    auto coCreate = reinterpret_cast<PFN_CoCreate>(reinterpret_cast<void*>(GetProcAddress(ole, "CoCreateInstance")));
+    auto coFree = reinterpret_cast<PFN_Free>(reinterpret_cast<void*>(GetProcAddress(ole, "CoTaskMemFree")));
+    if (!init || !coCreate || !coFree) return false;
+    init(nullptr, COINIT_APARTMENTTHREADED);
+    IFileOpenDialog* fd = nullptr;
+    if (FAILED(coCreate(kFileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, kIFileOpenDialog, reinterpret_cast<void**>(&fd)))) return false;
+    DWORD o = 0;
+    fd->GetOptions(&o);
+    fd->SetOptions(o | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    fd->SetTitle(L"Save the download to");
+    IShellItem* start = nullptr;
+    if (SUCCEEDED(SHCreateItemFromParsingName(dir.c_str(), nullptr, kIShellItem, reinterpret_cast<void**>(&start)))) {
+        fd->SetFolder(start);
+        start->Release();
+    }
+    bool ok = false;
+    IShellItem* it = nullptr;
+    if (SUCCEEDED(fd->Show(g_dlWnd)) && SUCCEEDED(fd->GetResult(&it))) {
+        PWSTR p = nullptr;
+        if (SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &p)) && p) { dir = p; coFree(p); ok = true; }
+        it->Release();
+    }
+    fd->Release();
+    return ok;
+}
+
+// -- the engine (worker threads; nothing here touches the UI) --
+
+void DlFail(Download* d, const std::wstring& why) {
+    EnterCriticalSection(&d->cs);
+    if (d->state == DS_RUN) { d->error = why; d->state = DS_FAIL; }
+    LeaveCriticalSection(&d->cs);
+}
+
+bool DlCrack(Download* d) {
+    URL_COMPONENTS u{};
+    u.dwStructSize = sizeof(u);
+    u.dwHostNameLength = u.dwUrlPathLength = u.dwExtraInfoLength = static_cast<DWORD>(-1);
+    if (!WinHttpCrackUrl(d->url.c_str(), 0, 0, &u) || !u.dwHostNameLength) return false;
+    std::wstring host(u.lpszHostName, u.dwHostNameLength);
+    std::wstring object = std::wstring(u.lpszUrlPath, u.dwUrlPathLength) + std::wstring(u.lpszExtraInfo, u.dwExtraInfoLength);
+    if (host != d->host || u.nPort != d->port || !d->conn) {
+        if (d->conn) WinHttpCloseHandle(d->conn);
+        d->conn = WinHttpConnect(d->session, host.c_str(), u.nPort, 0);
+    }
+    d->host = host;
+    d->object = object.empty() ? L"/" : object;
+    d->port = u.nPort;
+    d->https = u.nScheme == INTERNET_SCHEME_HTTPS;
+    return d->conn != nullptr;
+}
+
+std::wstring DlQuery(HINTERNET r, DWORD what) {
+    DWORD sz = 0;
+    WinHttpQueryHeaders(r, what, WINHTTP_HEADER_NAME_BY_INDEX, WINHTTP_NO_OUTPUT_BUFFER, &sz, WINHTTP_NO_HEADER_INDEX);
+    if (!sz) return L"";
+    std::wstring s(sz / sizeof(wchar_t) + 1, L'\0');
+    if (!WinHttpQueryHeaders(r, what, WINHTTP_HEADER_NAME_BY_INDEX, &s[0], &sz, WINHTTP_NO_HEADER_INDEX)) return L"";
+    s.resize(sz / sizeof(wchar_t));
+    return s;
+}
+
+// GET bytes [from, to] (to < 0: to the end). Returns the answered request, status in `status`.
+HINTERNET DlRequest(Download* d, long long from, long long to, DWORD& status) {
+    status = 0;
+    HINTERNET r = WinHttpOpenRequest(d->conn, L"GET", d->object.c_str(), nullptr, WINHTTP_NO_REFERER,
+                                     WINHTTP_DEFAULT_ACCEPT_TYPES, d->https ? WINHTTP_FLAG_SECURE : 0);
+    if (!r) return nullptr;
+    std::wstring hdr = L"Accept-Encoding: identity\r\nRange: bytes=" + std::to_wstring(from) + L"-" +
+                       (to >= 0 ? std::to_wstring(to) : L"") + L"\r\n";
+    if (!d->referrer.empty()) hdr += L"Referer: " + d->referrer + L"\r\n";
+    if (!d->cookies.empty()) hdr += L"Cookie: " + d->cookies + L"\r\n";
+    DWORD sz = sizeof(status);
+    if (WinHttpSendRequest(r, hdr.c_str(), static_cast<DWORD>(-1L), WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(r, nullptr) &&
+        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz,
+                            WINHTTP_NO_HEADER_INDEX))
+        return r;
+    WinHttpCloseHandle(r);
+    return nullptr;
+}
+
+// Reads segment i from request r until the segment is complete (true) or the stream fails.
+bool DlPump(Download* d, int i, HINTERNET r, std::vector<char>& buf) {
+    for (;;) {
+        if (d->state != DS_RUN) return false;
+        DWORD n = 0;
+        if (!WinHttpReadData(r, buf.data(), static_cast<DWORD>(buf.size()), &n)) return false;
+        EnterCriticalSection(&d->cs);
+        DlSeg& s = d->segs[i];
+        if (n == 0 && s.end == LLONG_MAX) { s.end = s.pos; d->size = s.pos; } // size unknown: the stream's end is the file's end
+        long long off = s.pos, take = std::min<long long>(n, s.end - s.pos); // the end may have moved: another connection took the rest
+        s.pos += take;
+        bool fin = s.pos >= s.end;
+        LeaveCriticalSection(&d->cs);
+        if (take > 0) {
+            OVERLAPPED ov{};
+            ov.Offset = static_cast<DWORD>(off);
+            ov.OffsetHigh = static_cast<DWORD>(off >> 32);
+            DWORD wr = 0;
+            if (!WriteFile(d->file, buf.data(), static_cast<DWORD>(take), &wr, &ov) || wr != take) {
+                DlFail(d, L"couldn't write the file - is the disk full?");
+                return false;
+            }
+            d->got += take;
+        }
+        if (fin) return true;
+        if (n == 0) return false; // the server closed early
+    }
+}
+
+// A free connection picks its next part: a part nobody is fetching, else the second half
+// of the biggest part still left. -1 = nothing worth taking.
+int DlClaim(Download* d) {
+    if (!d->ranges) return -1;
+    EnterCriticalSection(&d->cs);
+    int best = -1;
+    long long bestLeft = 0;
+    for (int k = 0; k < static_cast<int>(d->segs.size()); ++k) {
+        DlSeg& s = d->segs[k];
+        if (!s.owned && s.pos < s.end) { s.owned = true; LeaveCriticalSection(&d->cs); return k; }
+        if (s.owned && s.end - s.pos > bestLeft) { bestLeft = s.end - s.pos; best = k; }
+    }
+    int got = -1;
+    if (best >= 0 && bestLeft >= 2 * DL_MIN_SPLIT) {
+        long long mid = d->segs[best].pos + bestLeft / 2, end = d->segs[best].end;
+        d->segs[best].end = mid;
+        d->segs.push_back({ mid, mid, end, end, true });
+        got = static_cast<int>(d->segs.size()) - 1;
+    }
+    LeaveCriticalSection(&d->cs);
+    return got;
+}
+
+// A connection gives up its part. If it got nothing yet and the connection before it is
+// still streaming those bytes (its request reaches that far), they go back to it; else
+// the part waits for the next free connection.
+void DlRelease(Download* d, int i) {
+    EnterCriticalSection(&d->cs);
+    DlSeg& p = d->segs[i];
+    p.owned = false;
+    for (auto& o : d->segs)
+        if (&o != &p && o.owned && o.end == p.pos && o.reqEnd >= p.end) { o.end = p.end; p.end = p.pos; break; }
+    LeaveCriticalSection(&d->cs);
+}
+
+// One connection's life: fetch its part, then keep taking more until nothing is left.
+void DlWorkLoop(Download* d, int i, HINTERNET r) {
+    std::vector<char> buf(256 * 1024);
+    int fails = 0;
+    while (d->state == DS_RUN) {
+        if (i < 0 && (i = DlClaim(d)) < 0) break;
+        if (!r) {
+            EnterCriticalSection(&d->cs);
+            long long from = d->segs[i].pos, to = d->segs[i].end;
+            d->segs[i].reqEnd = to;
+            LeaveCriticalSection(&d->cs);
+            if (from >= to) { i = -1; continue; }
+            DWORD st = 0;
+            r = DlRequest(d, from, to - 1, st);
+            if (!r || st != 206) {
+                if (r) { WinHttpCloseHandle(r); r = nullptr; }
+                if (st) { // answered, but not with the part: the server won't take another connection
+                    EnterCriticalSection(&d->cs);
+                    d->error = L"the server answered " + std::to_wstring(st);
+                    LeaveCriticalSection(&d->cs);
+                }
+                // others still going: this server wants fewer connections, so this one bows out
+                if ((st && d->conns > 0) || ++fails > 6) { DlRelease(d, i); break; }
+                Sleep(700 * fails);
+                continue;
+            }
+        }
+        EnterCriticalSection(&d->cs);
+        long long before = d->segs[i].pos;
+        LeaveCriticalSection(&d->cs);
+        ++d->conns;
+        bool fin = DlPump(d, i, r, buf);
+        --d->conns;
+        WinHttpCloseHandle(r);
+        r = nullptr;
+        if (fin) { i = -1; fails = 0; continue; }
+        if (d->state != DS_RUN) break;
+        if (!d->ranges) { DlFail(d, L"the connection dropped and this server can't resume"); break; }
+        EnterCriticalSection(&d->cs);
+        if (d->segs[i].pos > before) fails = 0; // it got somewhere: a fresh try
+        LeaveCriticalSection(&d->cs);
+        if (++fails > 6) { DlRelease(d, i); break; }
+        Sleep(700 * fails); // then resume this part from where it stopped
+    }
+    if (r) WinHttpCloseHandle(r);
+}
+
+// The last thread out closes the file: done (keep it) or not (delete-on-close drops it).
+void DlFinish(Download* d) {
+    EnterCriticalSection(&d->cs);
+    bool complete = d->file != INVALID_HANDLE_VALUE && !d->segs.empty();
+    for (const auto& s : d->segs) complete = complete && s.pos >= s.end;
+    complete = complete && d->state == DS_RUN;
+    if (d->file != INVALID_HANDLE_VALUE) {
+        if (complete) {
+            FILE_SET_SPARSE_BUFFER sp{ FALSE };
+            DWORD br = 0;
+            DeviceIoControl(d->file, FSCTL_SET_SPARSE, &sp, sizeof(sp), nullptr, 0, &br, nullptr);
+            FILE_DISPOSITION_INFO keep{ FALSE };
+            SetFileInformationByHandle(d->file, FileDispositionInfo, &keep, sizeof(keep));
+        }
+        CloseHandle(d->file);
+        d->file = INVALID_HANDLE_VALUE;
+    }
+    if (complete) { d->doneAt = GetTickCount(); d->state = DS_DONE; }
+    else if (d->state == DS_RUN) { d->state = DS_FAIL; if (d->error.empty()) d->error = L"the server stopped sending it"; }
+    LeaveCriticalSection(&d->cs);
+}
+
+void DlThreadDone(Download* d) { if (--d->threads == 0) DlFinish(d); }
+
+DWORD WINAPI DlWorker(void* p) {
+    Download* d = static_cast<Download*>(p);
+    DlWorkLoop(d, -1, nullptr);
+    DlThreadDone(d);
+    return 0;
+}
+
+// First connection: follows redirects, learns the size and whether the server can send
+// parts, creates the file, starts the other connections, then downloads like the rest.
+DWORD WINAPI DlMain(void* p) {
+    Download* d = static_cast<Download*>(p);
+    d->session = WinHttpOpen(d->ua.empty() ? L"Mozilla/5.0" : d->ua.c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!d->session) d->session = WinHttpOpen(L"Mozilla/5.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET r = nullptr;
+    DWORD st = 0;
+    if (d->session) {
+        WinHttpSetTimeouts(d->session, 0, 15000, 15000, 10000); // a stalled connection gives up after 10 s and resumes
+        DWORD never = WINHTTP_OPTION_REDIRECT_POLICY_NEVER, conns = 32;
+        WinHttpSetOption(d->session, WINHTTP_OPTION_REDIRECT_POLICY, &never, sizeof(never)); // redirects by hand: see below
+        WinHttpSetOption(d->session, WINHTTP_OPTION_MAX_CONNS_PER_SERVER, &conns, sizeof(conns));
+        for (int hop = 0; hop < 10 && d->state == DS_RUN; ++hop) {
+            if (!DlCrack(d)) { DlFail(d, L"that link can't be opened"); break; }
+            for (int t = 0; t < 3 && !(r = DlRequest(d, 0, -1, st)) && d->state == DS_RUN; ++t) Sleep(1000);
+            if (!r) { DlFail(d, L"couldn't connect to " + d->host); break; }
+            if (st < 300 || st >= 400) break;
+            std::wstring loc = DlQuery(r, WINHTTP_QUERY_LOCATION);
+            WinHttpCloseHandle(r);
+            r = nullptr;
+            if (loc.empty()) { DlFail(d, L"the server answered " + std::to_wstring(st)); break; }
+            if (loc[0] == L'/')
+                loc = (d->https ? L"https://" : L"http://") + d->host + L":" + std::to_wstring(d->port) + loc;
+            std::wstring oldHost = d->host;
+            d->url = loc;
+            if (DlCrack(d) && d->host != oldHost) d->cookies.clear(); // a site's cookies never go to another host
+        }
+    } else {
+        DlFail(d, L"Windows' internet service isn't available");
+    }
+
+    if (r && (st == 200 || st == 206) && d->state == DS_RUN) {
+        long long total = 0;
+        if (st == 206) {
+            std::wstring cr = DlQuery(r, WINHTTP_QUERY_CONTENT_RANGE); // "bytes 0-999/1000"
+            size_t sl = cr.rfind(L'/');
+            if (sl != std::wstring::npos && sl + 1 < cr.size() && cr[sl + 1] != L'*') total = _wtoi64(cr.c_str() + sl + 1);
+        } else {
+            total = _wtoi64(DlQuery(r, WINHTTP_QUERY_CONTENT_LENGTH).c_str());
+        }
+        d->ranges = st == 206 && total > 0;
+        d->size = total;
+
+        EnterCriticalSection(&d->cs);
+        std::wstring name = d->name;
+        LeaveCriticalSection(&d->cs);
+        if (name.empty()) { // Content-Disposition, else the last part of the URL
+            std::wstring cd = DlQuery(r, WINHTTP_QUERY_CONTENT_DISPOSITION);
+            size_t k;
+            if ((k = cd.find(L"filename*=")) != std::wstring::npos) { // filename*=UTF-8''name%20here.zip
+                std::wstring v = cd.substr(k + 10);
+                v = v.substr(0, v.find(L';'));
+                size_t q = v.find(L"''");
+                name = DlPercentDecode(q == std::wstring::npos ? v : v.substr(q + 2));
+            } else if ((k = cd.find(L"filename=")) != std::wstring::npos) {
+                std::wstring v = cd.substr(k + 9);
+                if (!v.empty() && v[0] == L'"') v = v.substr(1, v.find(L'"', 1) - 1);
+                else v = v.substr(0, v.find(L';'));
+                name = v;
+            }
+            if (name.empty()) {
+                std::wstring path = d->object.substr(0, d->object.find(L'?'));
+                name = DlPercentDecode(path.substr(path.rfind(L'/') + 1));
+            }
+        }
+        name = DlCleanName(name);
+
+        ULARGE_INTEGER freeB{};
+        std::wstring part = DlUnique(d->partDir, name, L".reico-part");
+        HANDLE f = INVALID_HANDLE_VALUE;
+        if (total > 0 && GetDiskFreeSpaceExW(d->partDir.c_str(), &freeB, nullptr, nullptr) && freeB.QuadPart < static_cast<ULONGLONG>(total)) {
+            DlFail(d, L"not enough free space - it needs " + DlBytes(static_cast<double>(total)));
+        } else if ((f = CreateFileW(part.c_str(), GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr, CREATE_NEW,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr)) == INVALID_HANDLE_VALUE) {
+            DlFail(d, L"couldn't create the file in " + d->partDir);
+        } else {
+            FILE_DISPOSITION_INFO drop{ TRUE };  // until it's complete: gone if REICO closes or it fails
+            SetFileInformationByHandle(f, FileDispositionInfo, &drop, sizeof(drop));
+            DWORD br = 0;
+            DeviceIoControl(f, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &br, nullptr);
+            if (total > 0) {
+                LARGE_INTEGER li;
+                li.QuadPart = total;
+                SetFilePointerEx(f, li, nullptr, FILE_BEGIN);
+                SetEndOfFile(f);
+            }
+            long long end = total > 0 ? total : LLONG_MAX;
+            EnterCriticalSection(&d->cs);
+            d->name = name;
+            d->part = part;
+            d->file = f;
+            d->segs = { { 0, 0, end, end, true } };
+            LeaveCriticalSection(&d->cs);
+            if (d->ranges)
+                for (int k = 1; k < DL_CONNS; ++k) {
+                    ++d->threads;
+                    HANDLE t = CreateThread(nullptr, 0, DlWorker, d, 0, nullptr);
+                    if (t) CloseHandle(t); else --d->threads;
+                }
+            DlWorkLoop(d, 0, r);
+            r = nullptr;
+        }
+    } else if (r && d->state == DS_RUN) {
+        DlFail(d, st == 401 || st == 403 ? L"the server refused it (" + std::to_wstring(st) + L") - try the browser's own download"
+                                         : L"the server answered " + std::to_wstring(st));
+    }
+    if (r) WinHttpCloseHandle(r);
+    DlThreadDone(d);
+    return 0;
+}
+
+// -- the cards (UI thread) --
+
+void DlRender();
+
+void DlShow() {
+    if (!g_dlWnd) {
+        g_dlNameF = InterFont(14, 600);
+        g_dlSmallF = InterFont(12, 500);
+        g_dlBtnF = InterFont(13, 600);
+        g_dlGlyphF = MakeFont(16, FW_NORMAL, L"Segoe MDL2 Assets");
+        g_dlWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"REICODownloads",
+                                  L"Downloads", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        int h = (DL_ASK_H + DL_GAP) * DL_MAX_CARDS;
+        if (!g_dlWnd || !SurfCreate(g_dlS, DL_W, h) || !SurfCreate(g_dlMask, DL_W, h)) return;
+    }
+    SetTimer(g_dlWnd, DL_TIMER, 100, nullptr);
+    DlRender();
+    ShowWindow(g_dlWnd, SW_SHOWNOACTIVATE);
+}
+
+bool DlStart(Download* d) {
+    InitializeCriticalSection(&d->cs);
+    d->born = GetTickCount();
+    d->threads = 1;
+    HANDLE t = CreateThread(nullptr, 0, DlMain, d, 0, nullptr);
+    if (!t) { DeleteCriticalSection(&d->cs); delete d; return false; }
+    CloseHandle(t);
+    g_dls.push_back(d);
+    DlShow();
+    return true;
+}
+
+// A download from the extension (JSON). false = let the browser download it.
+bool DlAdd(const std::string& json) {
+    if (!g_glassCfg.downloads) return false;
+    std::wstring url = DlHeaderSafe(DlJsonStr(json, "url"));
+    if ((_wcsnicmp(url.c_str(), L"http://", 7) && _wcsnicmp(url.c_str(), L"https://", 8)) || url.size() > 8192) return false;
+    if (g_dlDir.empty()) DlLoadDir();
+    Download* d = new Download();
+    d->url = url;
+    std::wstring name = DlJsonStr(json, "name");
+    if (!name.empty()) d->name = DlCleanName(name);
+    d->referrer = DlHeaderSafe(DlJsonStr(json, "referrer"));
+    d->cookies = DlHeaderSafe(DlJsonStr(json, "cookies"));
+    d->ua = DlHeaderSafe(DlJsonStr(json, "ua"));
+    d->size = DlJsonNum(json, "size");
+    d->dir = d->partDir = g_dlDir;
+    Log(L"Downloads: caught " + url);
+    return DlStart(d);
+}
+
+void DlRetry(const Download* o) {
+    Download* d = new Download();
+    d->url = o->url; d->referrer = o->referrer; d->cookies = o->cookies; d->ua = o->ua;
+    EnterCriticalSection(const_cast<CRITICAL_SECTION*>(&o->cs));
+    d->name = o->name;
+    LeaveCriticalSection(const_cast<CRITICAL_SECTION*>(&o->cs));
+    d->dir = d->partDir = o->dir;
+    d->confirmed = true;
+    DlStart(d);
+}
+
+// Off the screen; freed by DlTick once its threads have stopped.
+void DlDismiss(Download* d) {
+    EnterCriticalSection(&d->cs);
+    if (d->state == DS_RUN) d->state = DS_CANCEL;              // the threads stop, the part file deletes itself
+    else if (d->state == DS_DONE && !d->moving) DeleteFileW(d->part.c_str()); // finished, but you said no
+    LeaveCriticalSection(&d->cs);
+    g_dls.erase(std::remove(g_dls.begin(), g_dls.end(), d), g_dls.end());
+    g_dlGone.push_back(d);
+    if (g_dlHot.d == d) g_dlHot = DlHit{};
+}
+
+// Finished and confirmed: from "<name>.reico-part" to its real name in the chosen folder.
+// Its own thread: to another drive it's a full copy, and antivirus may hold the file a while.
+DWORD WINAPI DlMover(void* p) {
+    Download* d = static_cast<Download*>(p);
+    std::wstring dest = DlUnique(d->dir, d->name);
+    if (MoveFileExW(d->part.c_str(), dest.c_str(), MOVEFILE_COPY_ALLOWED)) {
+        d->final = dest;
+        d->savedAt = GetTickCount();
+    } else {
+        DeleteFileW(d->part.c_str());
+        EnterCriticalSection(&d->cs);
+        d->error = L"couldn't save it to " + d->dir;
+        LeaveCriticalSection(&d->cs);
+        d->state = DS_FAIL;
+    }
+    d->moved = true;
+    --d->threads;
+    return 0;
+}
+
+void DlMove(Download* d) {
+    d->moving = true;
+    ++d->threads;
+    HANDLE t = CreateThread(nullptr, 0, DlMover, d, 0, nullptr);
+    if (t) CloseHandle(t); else DlMover(d);
+}
+
+void DlButton(Canvas c, Download* d, int act, RECT r, const wchar_t* label, bool primary, float a, HFONT f) {
+    bool hot = g_dlHot.d == d && g_dlHot.act == act;
+    GlassBlob(c, static_cast<float>(r.left), static_cast<float>(r.top), static_cast<float>(r.right), static_cast<float>(r.bottom),
+              (r.bottom - r.top) / 2.f, primary ? (hot ? 0.8f : 0.6f) : (hot ? 0.35f : 0.f), hot ? 0.2f : 0.1f, a);
+    DrawTextOn(c, g_dlMask, label, r, f, RGB(255, 255, 255), 0.95f * a, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    g_dlHits.push_back({ r, d, act });
+}
+
+void DlDrawCard(Canvas c, Download* d, int y, int h, float a) {
+    const COLORREF white = RGB(255, 255, 255);
+    COLORREF tint = RGB(g_glassCfg.tintR, g_glassCfg.tintG, g_glassCfg.tintB);
+    COLORREF veil = RGB(GetRValue(tint) * 3 / 10 + 14, GetGValue(tint) * 3 / 10 + 14, GetBValue(tint) * 3 / 10 + 18);
+    FillRRect(c, 0.5f, y + 0.5f, DL_W - 0.5f, y + h - 0.5f, 20, veil, 0.9f * a);
+    GlassLight(c, 0.5f, y + 0.5f, DL_W - 0.5f, y + h - 0.5f, 20, a);
+
+    EnterCriticalSection(&d->cs);
+    std::wstring name = d->name, err = d->error;
+    std::vector<DlSeg> segs = d->segs;
+    LeaveCriticalSection(&d->cs);
+    int st = d->state;
+    double size = static_cast<double>(d->size), got = static_cast<double>(d->got);
+    bool done = st == DS_DONE && (d->moved || !d->confirmed); // confirmed: done once it's saved
+
+    GlassBlob(c, 16, y + 16.f, 54, y + 54.f, 19, 0.55f, 0.1f, a);
+    DrawGlassText(c, g_dlMask, st == DS_FAIL ? L"\uE783" : done ? L"\uE73E" : L"\uE896", { 16, y + 16, 54, y + 54 }, g_dlGlyphF, a,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE, 0.f, 0.85f);
+    if (name.empty()) name = st == DS_FAIL ? d->url : L"Connecting\u2026";
+    DrawTextOn(c, g_dlMask, name.c_str(), { 66, y + 14, DL_W - (d->confirmed ? 54 : 16), y + 34 },
+               g_dlNameF, white, 0.97f * a, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    std::wstring line;
+    if (st == DS_FAIL) line = L"Failed: " + err;
+    else if (done && d->confirmed) {
+        double secs = std::max<DWORD>(1, (d->doneAt - d->born) / 1000);
+        line = L"Done \u00B7 " + DlBytes(size) + L" in " + DlTime(static_cast<long long>(secs)) + L" \u00B7 " + DlBytes(size / secs) + L"/s";
+    } else if (!d->confirmed) line = (size > 0 ? DlBytes(size) : std::wstring(L"Size unknown")) + L" \u00B7 " + d->host; // progress is below
+    else {
+        line = size > 0 ? DlBytes(got) + L" of " + DlBytes(size) : DlBytes(got);
+        if (d->speed > 0) line += L" \u00B7 " + DlBytes(d->speed) + L"/s";
+        if (d->speed > 0 && size > got) line += L" \u00B7 " + DlTime(static_cast<long long>((size - got) / d->speed)) + L" left";
+    }
+    DrawTextOn(c, g_dlMask, line.c_str(), { 66, y + 34, DL_W - 16, y + 52 }, g_dlSmallF, white, 0.62f * a,
+               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    auto bar = [&](float y0) { // every connection's part, as it fills in
+        FillRRect(c, 16, y0, DL_W - 16.f, y0 + 8, 4, white, 0.12f * a);
+        if (size <= 0) return;
+        const float x0 = 16, w = DL_W - 32.f;
+        for (const auto& s : segs) {
+            float s0 = x0 + w * static_cast<float>(s.start / size), s1 = x0 + w * static_cast<float>(std::min<double>(s.pos, size) / size);
+            if (s1 - s0 >= 1.f) FillRRect(c, s0, y0, s1, y0 + 8, std::min(4.f, (s1 - s0) / 2), AccentColour(), 0.95f * a);
+        }
+        GlassLight(c, 16, y0, DL_W - 16.f, y0 + 8, 4, 0.6f * a);
+    };
+
+    if (!d->confirmed) { // where to save + Download / Cancel
+        FillRRect(c, 16, y + 64.f, DL_W - 16.f, y + 98.f, 17, white, 0.07f * a);
+        GlassLight(c, 16, y + 64.f, DL_W - 16.f, y + 98.f, 17, 0.5f * a);
+        DrawTextOn(c, g_dlMask, L"\uED25", { 24, y + 64, 50, y + 98 }, g_dlGlyphF, white, 0.6f * a, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextOn(c, g_dlMask, d->dir.c_str(), { 54, y + 64, DL_W - 112, y + 98 }, g_dlSmallF, white, 0.9f * a,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
+        DlButton(c, d, DA_FOLDER, { DL_W - 104, y + 69, DL_W - 21, y + 93 }, L"Change", false, a, g_dlSmallF);
+        std::wstring pre = st == DS_FAIL ? L"" : done ? L"Already downloaded - choose where to keep it"
+                                         : L"Already downloading" + (size > 0 ? L" \u00B7 " + std::to_wstring(static_cast<int>(got * 100 / size)) + L"%" : L"") +
+                                           (d->speed > 0 ? L" \u00B7 " + DlBytes(d->speed) + L"/s" : L"");
+        DrawTextOn(c, g_dlMask, pre.c_str(), { 18, y + 104, DL_W - 16, y + 122 }, g_dlSmallF, white, 0.55f * a,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (st != DS_FAIL) DlButton(c, d, DA_GO, { DL_W - 148, y + 128, DL_W - 16, y + 158 }, L"Download", true, a, g_dlBtnF);
+        DlButton(c, d, DA_CANCEL, { DL_W - 260, y + 128, DL_W - 156, y + 158 }, L"Cancel", false, a, g_dlBtnF);
+        return;
+    }
+    DlButton(c, d, DA_CLOSE, { DL_W - 46, y + 12, DL_W - 16, y + 42 }, L"\uE711", false, a, g_dlGlyphF);
+    if (done) {
+        DlButton(c, d, DA_OPEN, { 16, y + 62, 104, y + 92 }, L"Open", true, a, g_dlBtnF);
+        DlButton(c, d, DA_SHOW, { 112, y + 62, 252, y + 92 }, L"Show in folder", false, a, g_dlBtnF);
+    } else if (st == DS_FAIL) {
+        DlButton(c, d, DA_RETRY, { 16, y + 62, 104, y + 92 }, L"Retry", true, a, g_dlBtnF);
+    } else {
+        bar(y + 62.f);
+        int n = d->conns;
+        std::wstring info = (st == DS_DONE ? std::wstring(L"Saving…")
+                             : n > 0 ? std::to_wstring(n) + (n == 1 ? L" connection" : L" connections") : std::wstring(L"Connecting")) +
+                            L" \u00B7 saving to " + fs::path(d->dir).filename().wstring();
+        DrawTextOn(c, g_dlMask, info.c_str(), { 16, y + 76, DL_W - 16, y + 94 }, g_dlSmallF, white, 0.5f * a,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+}
+
+void DlRender() {
+    if (!g_dlWnd) return;
+    DWORD now = GetTickCount();
+    Canvas c = g_dlS.cv();
+    ZeroMemory(c.px, sizeof(UINT32) * static_cast<size_t>(c.w) * c.h);
+    g_dlHits.clear();
+    int y = 0, shown = 0;
+    for (auto it = g_dls.rbegin(); it != g_dls.rend() && shown < DL_MAX_CARDS; ++it, ++shown) { // newest on top
+        Download* d = *it;
+        int h = d->confirmed ? DL_CARD_H : DL_ASK_H;
+        DlDrawCard(c, d, y, h, EaseOut3((now - d->born) / 220.f));
+        y += h + DL_GAP;
+    }
+    RECT wa{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0); // below the dock when it's on
+    g_dlPos = { wa.right - DL_W - 16, wa.top + 12 };
+    POINT src{ 0, 0 };
+    SIZE sz{ DL_W, std::max(1, y - DL_GAP) };
+    BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    UpdateLayeredWindow(g_dlWnd, nullptr, &g_dlPos, &sz, g_dlS.dc, &src, 0, &bf, ULW_ALPHA);
+}
+
+void DlTick() {
+    DWORD now = GetTickCount();
+    for (size_t k = 0; k < g_dls.size(); ++k) {
+        Download* d = g_dls[k];
+        int n = std::min(d->samples, 32), slot = d->samples % 32; // speed over the last ~3 s
+        d->sampleT[slot] = now;
+        d->sampleB[slot] = d->got;
+        ++d->samples;
+        int oldest = n < 32 ? 0 : (slot + 1) % 32;
+        DWORD dt = now - d->sampleT[oldest];
+        d->speed = dt >= 300 ? (d->got - d->sampleB[oldest]) * 1000.0 / dt : d->speed;
+        if (d->state == DS_DONE && d->confirmed && !d->moving) DlMove(d);
+    }
+    for (size_t k = 0; k < g_dls.size(); ++k) { // finished cards leave by themselves after 15 s
+        Download* d = g_dls[k];
+        if (d->state == DS_DONE && d->moved && !g_dlHover && now - d->savedAt > 15000) { DlDismiss(d); --k; }
+    }
+    for (size_t k = 0; k < g_dlGone.size(); ++k) {
+        Download* d = g_dlGone[k];
+        if (d->threads != 0) continue;
+        if (d->conn) WinHttpCloseHandle(d->conn);
+        if (d->session) WinHttpCloseHandle(d->session);
+        DeleteCriticalSection(&d->cs);
+        delete d;
+        g_dlGone.erase(g_dlGone.begin() + k--);
+    }
+    if (!g_dls.empty()) DlRender();
+    else {
+        ShowWindow(g_dlWnd, SW_HIDE);
+        if (g_dlGone.empty()) KillTimer(g_dlWnd, DL_TIMER);
+    }
+}
+
+DlHit DlHitAt(POINT p) {
+    for (const auto& h : g_dlHits) if (PtInRect(&h.r, p)) return h;
+    return DlHit{};
+}
+
+void DlAction(const DlHit& h) {
+    Download* d = h.d;
+    if (std::find(g_dls.begin(), g_dls.end(), d) == g_dls.end()) return;
+    switch (h.act) {
+    case DA_GO: d->confirmed = true; break;
+    case DA_CANCEL: case DA_CLOSE: DlDismiss(d); break;
+    case DA_FOLDER: {
+        std::wstring dir = d->dir;
+        if (DlPickFolder(dir)) { d->dir = g_dlDir = dir; WriteUtf8(DL_DIR_TXT, dir); }
+        break;
+    }
+    case DA_OPEN: ShellExecuteW(nullptr, L"open", d->final.c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
+    case DA_SHOW: ShellExecuteW(nullptr, L"open", L"explorer.exe", (L"/select,\"" + d->final + L"\"").c_str(), nullptr, SW_SHOWNORMAL); break;
+    case DA_RETRY: DlRetry(d); DlDismiss(d); break;
+    }
+    DlRender();
+}
+
+LRESULT CALLBACK DlProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    switch (msg) {
+    case WM_TIMER: DlTick(); return 0;
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE; // don't take focus from the browser
+    case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, h, 0 };
+        TrackMouseEvent(&tme);
+        g_dlHover = true;
+        DlHit hit = DlHitAt(POINT{ GET_X_LPARAM(l), GET_Y_LPARAM(l) });
+        if (hit.d != g_dlHot.d || hit.act != g_dlHot.act) { g_dlHot = hit; DlRender(); }
+        return 0;
+    }
+    case WM_MOUSELEAVE: g_dlHover = false; g_dlHot = DlHit{}; DlRender(); return 0;
+    case WM_SETCURSOR: SetCursor(LoadCursor(nullptr, g_dlHot.d ? IDC_HAND : IDC_ARROW)); return TRUE;
+    case WM_LBUTTONDOWN: g_dlPressed = DlHitAt(POINT{ GET_X_LPARAM(l), GET_Y_LPARAM(l) }); return 0;
+    case WM_LBUTTONUP: {
+        DlHit hit = DlHitAt(POINT{ GET_X_LPARAM(l), GET_Y_LPARAM(l) });
+        if (hit.d && hit.d == g_dlPressed.d && hit.act == g_dlPressed.act) DlAction(hit);
+        g_dlPressed = DlHit{};
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+
+void DlInit() {
+    WNDCLASSW wc{};
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpfnWndProc = DlProc;
+    wc.lpszClassName = L"REICODownloads";
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    RegisterClassW(&wc);
+
+    // the native-messaging host the extension talks to: this exe, for Chrome, Edge, Brave and Chromium
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring esc;
+    for (const wchar_t* p = exe; *p; ++p) { if (*p == L'\\' || *p == L'"') esc += L'\\'; esc += *p; }
+    WriteUtf8(DL_HOST_JSON, L"{\n  \"name\": \"com.reico.downloads\",\n  \"description\": \"REICO download manager\",\n  \"path\": \"" + esc +
+                            L"\",\n  \"type\": \"stdio\",\n  \"allowed_origins\": [\"chrome-extension://" + DL_EXT_ID + L"/\"]\n}\n");
+    for (const wchar_t* b : { L"Google\\Chrome", L"Microsoft\\Edge", L"BraveSoftware\\Brave-Browser", L"Chromium" }) {
+        HKEY k;
+        std::wstring key = std::wstring(L"Software\\") + b + L"\\NativeMessagingHosts\\com.reico.downloads";
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) == ERROR_SUCCESS) {
+            RegSetValueExW(k, nullptr, 0, REG_SZ, reinterpret_cast<const BYTE*>(DL_HOST_JSON), static_cast<DWORD>((wcslen(DL_HOST_JSON) + 1) * sizeof(wchar_t)));
+            RegCloseKey(k);
+        }
+    }
+}
+
+// "REICO.exe chrome-extension://..." - the browser's native-messaging call. Reads one
+// message (4-byte length + JSON), hands it to the running REICO, answers, exits.
+int DlHostMain() {
+    HANDLE in = GetStdHandle(STD_INPUT_HANDLE), out = GetStdHandle(STD_OUTPUT_HANDLE);
+    auto readAll = [&](void* b, DWORD n) {
+        for (DWORD got = 0, k = 0; got < n; got += k)
+            if (!ReadFile(in, static_cast<char*>(b) + got, n - got, &k, nullptr) || !k) return false;
+        return true;
+    };
+    UINT32 len = 0;
+    bool ok = false;
+    if (readAll(&len, 4) && len > 0 && len < (1u << 20)) {
+        std::string json(len, '\0');
+        HWND tray = FindWindowW(L"REICOTray", nullptr);
+        if (readAll(&json[0], len) && tray) {
+            COPYDATASTRUCT cd{ DL_COPYDATA_ID, len, &json[0] };
+            DWORD_PTR res = 0;
+            ok = SendMessageTimeoutW(tray, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&cd), SMTO_ABORTIFHUNG, 5000, &res) && res == 1;
+        }
+    }
+    const char* reply = ok ? "{\"ok\":true}" : "{\"ok\":false}";
+    UINT32 n = static_cast<UINT32>(strlen(reply));
+    DWORD w = 0;
+    WriteFile(out, &n, 4, &w, nullptr);
+    WriteFile(out, reply, n, &w, nullptr);
+    return 0;
+}
+
 int DockHit(POINT p) {
     const int sideHit[3] = { DH_GAMES, DH_TASKMGR, DH_NOTES };
     for (int i = 0; i < 3; ++i) {
@@ -7450,6 +8357,11 @@ LRESULT CALLBACK TrayProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     }
     switch (msg) {
+    case WM_COPYDATA: { // a browser download, from the REICO Downloads extension (see DlHostMain)
+        auto* cd = reinterpret_cast<const COPYDATASTRUCT*>(l);
+        return cd->dwData == DL_COPYDATA_ID && cd->cbData < (1u << 20) &&
+               DlAdd(std::string(static_cast<const char*>(cd->lpData), cd->cbData)) ? 1 : 0;
+    }
     case WM_TRAY:
         if (LOWORD(l) == WM_RBUTTONUP) {
             PanelClose();
@@ -7499,6 +8411,7 @@ void UiInit() {
 
     PanelInit(); // also loads the Inter fonts the logo uses
     NpInit();    // now-playing pop-up + its media watcher thread
+    DlInit();    // download manager window + the browser extension's native-messaging host
     if (g_glassCfg.dock) DockEnable();
     else TaskbarRestore(); // a previous run ended without turning the dock off: undo its auto-hide
     g_logoIcon = MakeLogoIcon(GetSystemMetrics(SM_CXSMICON) > 16 ? 32 : 16);
@@ -7528,6 +8441,8 @@ void UiShutdown() {
     nid.uID = 1;
     Shell_NotifyIconW(NIM_DELETE, &nid);
     if (g_settingsWnd) DestroyWindow(g_settingsWnd);
+    for (Download* d : g_dls) // finished but never answered: don't leave the file behind
+        if (d->state == DS_DONE && !d->moving) DeleteFileW(d->part.c_str());
     DockShutdown(); // also gives Windows its own taskbar setting back
     NpShutdown();
     PanelShutdown();
@@ -7907,6 +8822,9 @@ int WINAPI wWinMain(
     PWSTR,
     int
 ) {
+
+    // started by the browser for the REICO Downloads extension: hand over the download and exit
+    if (wcsstr(GetCommandLineW(), L"chrome-extension://")) return DlHostMain();
 
     Log(L"App starting...");
 
