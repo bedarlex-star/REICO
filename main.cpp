@@ -25,6 +25,7 @@
 #include <cwchar>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1228,8 +1229,9 @@ struct GlassConfig {
     int  iconGlassAmount = 65;          // % glass; the rest is the solid tinted icon (recognizability)
     bool nowPlaying = true;             // liquid-glass pop-up when a song starts / stops
     bool dock = false;                  // REICO's glass taskbar at the top (Windows' taskbar auto-hides)
-    bool btnGames = true, btnTaskMgr = true, btnNotes = true; // the round buttons at the top-left
+    bool btnGames = true, btnTaskMgr = true, btnNotes = true, btnConvert = true; // the round buttons at the top-left
     bool downloads = true;              // take browser downloads (REICO Downloads extension)
+    bool liquidAnim = true;             // windows pour out of their buttons (off: plain fades)
     std::vector<std::wstring> classes{ L"CabinetWClass" }; // cmd is NOT default: too heavy
 };
 
@@ -1334,9 +1336,12 @@ void LoadGlassConfig() {
                "btnGames=1\n"
                "btnTaskMgr=1\n"
                "btnNotes=1\n"
+               "btnConvert=1\n"
                "# downloads: 1 = REICO's multi-connection download manager takes browser downloads\n"
                "# (needs the REICO Downloads extension from C:\\REICO\\extension)\n"
                "downloads=1\n"
+               "# liquidAnim: 1 = windows pour out of the button that opened them like a glass drop\n"
+               "liquidAnim=1\n"
                "# one class= line per window type to affect\n"
                "class=CabinetWClass\n"
                "# cmd (ConsoleWindowClass) is heavy with blur - not enabled by default.\n"
@@ -1404,6 +1409,10 @@ void LoadGlassConfig() {
             g_glassCfg.btnTaskMgr = std::atoi(val.c_str()) != 0;
         } else if (key == "btnNotes") {
             g_glassCfg.btnNotes = std::atoi(val.c_str()) != 0;
+        } else if (key == "btnConvert") {
+            g_glassCfg.btnConvert = std::atoi(val.c_str()) != 0;
+        } else if (key == "liquidAnim") {
+            g_glassCfg.liquidAnim = std::atoi(val.c_str()) != 0;
         } else if (key == "downloads") {
             g_glassCfg.downloads = std::atoi(val.c_str()) != 0;
         } else if (key == "nowPlaying") {
@@ -2569,6 +2578,250 @@ HFONT InterFont(int px, int weight) {
     return MakeFont(px, FW_NORMAL, L"Inter");
 }
 
+// ---- liquid open / close: windows pour out of the button that opened them ----------
+//
+// A glass drop beads on the button, pulls away with a liquid bridge that stretches and
+// snaps, then swells into the window with a soft spring and wobble while its content
+// fades in. Closing pours it back into the button. It's drawn on one see-through overlay
+// window; the real window is only shown once the drop has become it. liquidAnim=0 (panel:
+// "Liquid animations") turns it off and every window uses its plain fade again.
+
+struct Liquid {
+    HWND wnd = nullptr;
+    Surface s;                  // the overlay: covers the drop's whole path
+    POINT org{};                // its top-left on screen
+    std::vector<UINT32> snap;   // the window's picture (premultiplied)
+    int w = 0, h = 0;
+    RECT win{}, icon{};         // overlay coordinates
+    float radius = 20.f;
+    bool opening = true, first = true;
+    DWORD start = 0, dur = 0;
+    RECT dirty{};               // what the last frame drew
+    std::function<void()> done;
+};
+Liquid g_lq;
+const UINT_PTR LQ_TIMER = 1;
+
+inline float LqSmooth(float a, float b, float x) { float t = Clamp01((x - a) / (b - a)); return t * t * (3.f - 2.f * t); }
+
+// One frame's shape: the drop (a rounded rect), the bead left on the button, and how
+// much of the window's picture shows through.
+struct LqShape {
+    float x0, y0, x1, y1, r;     // the drop
+    float icx, icy, nr, k;       // the bead and how gooey the bridge between them is
+    float content, fade, top, span, su, sv;
+    float vr, vg, vb;            // the tint veil
+    RECT bb;
+};
+
+void LqRows(const LqShape& f, LONG ya, LONG yb) {
+    const Liquid& L = g_lq;
+    UINT32* px = L.s.px;
+    const int cw = L.s.w;
+    const UINT32* S = L.snap.data();
+    auto b8 = [](float v) { return static_cast<UINT32>(std::min(255.f, std::max(0.f, v + 0.5f))); };
+    const float reach = (f.nr + f.k) * (f.nr + f.k);
+    for (LONG y = ya; y < yb; ++y) {
+        const float py = y + 0.5f;
+        UINT32* row = &px[static_cast<size_t>(y) * cw];
+        const float gloss = 0.14f * Clamp01(1.f - (py - f.top) / (f.span * 0.45f)); // light on the top of the drop
+        for (LONG x = f.bb.left; x < f.bb.right; ++x) {
+            const float px_ = x + 0.5f;
+            float d = RRectDist(px_, py, f.x0, f.y0, f.x1, f.y1, f.r);
+            const float dx = px_ - f.icx, dy = py - f.icy, dd = dx * dx + dy * dy;
+            if (f.nr > 0.5f && dd < reach) { // smooth union with the bead: the liquid bridge
+                float dc = std::sqrt(dd) - f.nr;
+                float hh = Clamp01(0.5f + 0.5f * (dc - d) / f.k);
+                d = dc + (d - dc) * hh - f.k * hh * (1.f - hh);
+            }
+            const float cov = Clamp01(0.5f - d) * f.fade;
+            if (cov <= 0.f) continue;
+
+            // glass: the tint veil, a bright rim at the edge, a little gloss on top (premultiplied)
+            const float lit = Clamp01(1.f + d / 2.5f) * 0.6f + gloss;
+            float ga = 0.82f * (1 - lit) + lit;
+            float gr = (f.vr * 0.82f * (1 - lit) + 255.f * lit), gg = (f.vg * 0.82f * (1 - lit) + 255.f * lit), gb = (f.vb * 0.82f * (1 - lit) + 255.f * lit);
+            float oa = ga, orr = gr, og = gg, ob = gb;
+            if (f.content > 0.f && px_ >= f.x0 && px_ < f.x1 && py >= f.y0 && py < f.y1) { // the window's picture, stretched to the drop
+                float u = (px_ - f.x0) * f.su - 0.5f, v = (py - f.y0) * f.sv - 0.5f;
+                int ux = static_cast<int>(std::floor(u)), vy = static_cast<int>(std::floor(v));
+                float fx = u - ux, fy = v - vy;
+                int ax = std::max(0, std::min(L.w - 1, ux)), bx = std::max(0, std::min(L.w - 1, ux + 1));
+                int ay = std::max(0, std::min(L.h - 1, vy)), by = std::max(0, std::min(L.h - 1, vy + 1));
+                UINT32 c00 = S[static_cast<size_t>(ay) * L.w + ax], c10 = S[static_cast<size_t>(ay) * L.w + bx];
+                UINT32 c01 = S[static_cast<size_t>(by) * L.w + ax], c11 = S[static_cast<size_t>(by) * L.w + bx];
+                auto ch = [&](int s8) {
+                    float a0 = ((c00 >> s8) & 0xFF) * (1 - fx) + ((c10 >> s8) & 0xFF) * fx;
+                    float a1 = ((c01 >> s8) & 0xFF) * (1 - fx) + ((c11 >> s8) & 0xFF) * fx;
+                    return a0 * (1 - fy) + a1 * fy;
+                };
+                const float c = f.content;
+                oa = ch(24) / 255.f * c + ga * (1 - c);
+                orr = ch(16) * c + gr * (1 - c);
+                og = ch(8) * c + gg * (1 - c);
+                ob = ch(0) * c + gb * (1 - c);
+            }
+            row[x] = (b8(oa * 255.f * cov) << 24) | (b8(orr * cov) << 16) | (b8(og * cov) << 8) | b8(ob * cov);
+        }
+    }
+}
+
+struct LqJob { const LqShape* f; LONG ya, yb; };
+DWORD WINAPI LqRowsThread(void* p) { auto* j = static_cast<LqJob*>(p); LqRows(*j->f, j->ya, j->yb); return 0; }
+
+void LqFrame(float t) {
+    Liquid& L = g_lq;
+    Canvas c = L.s.cv();
+    for (LONG y = L.dirty.top; y < L.dirty.bottom; ++y) // wipe the last frame
+        ZeroMemory(&c.px[static_cast<size_t>(y) * c.w + L.dirty.left], sizeof(UINT32) * (L.dirty.right - L.dirty.left));
+
+    // In stages: the bead swells on the button and stretches out on a liquid bridge,
+    // pulls away (the bridge thins and snaps), then swells into the window with a soft
+    // spring and a jelly wobble while the picture fades in. Closing runs it backwards, faster.
+    const float s = L.opening ? t : 1.f - t;                   // 0 = on the button, 1 = the window
+    // Each edge travels from the bead to the window's edge. The edges facing away from the
+    // button lead and the ones facing it lag, so the drop stretches out like poured liquid.
+    auto spring = [](float g) { g = Clamp01(g); return 1.f - std::exp(-6.5f * g) * std::cos(7.5f * g); }; // a little past, then settles
+    float lead, lag;
+    if (L.opening) { lead = spring((t - 0.06f) / 0.94f); lag = spring((t - 0.2f) / 0.8f); }
+    else { lead = LqSmooth(0.1f, 1.f, s); lag = LqSmooth(0.f, 0.85f, s); } // pours back: the far side first
+    const float wob = L.opening ? 0.04f * std::sin(20.f * t) * std::exp(-4.5f * t) * Clamp01(t * 6.f) : 0.f;
+
+    const float iw = static_cast<float>(L.icon.right - L.icon.left), ih = static_cast<float>(L.icon.bottom - L.icon.top);
+    const float isz = std::min(iw, ih), icx = (L.icon.left + L.icon.right) / 2.f, icy = (L.icon.top + L.icon.bottom) / 2.f;
+    const float W = static_cast<float>(L.w), H = static_cast<float>(L.h);
+    const float wcx = (L.win.left + L.win.right) / 2.f, wcy = (L.win.top + L.win.bottom) / 2.f;
+    const float bead = isz * 0.86f;                             // the drop starts a touch smaller than the button
+    const bool right = wcx >= icx, down = wcy >= icy;
+    auto edge = [](float from, float to, float e) { return from + (to - from) * e; };
+    float x0 = edge(icx - bead / 2, static_cast<float>(L.win.left), right ? lag : lead);
+    float x1 = edge(icx + bead / 2, static_cast<float>(L.win.right), right ? lead : lag);
+    float y0 = edge(icy - bead / 2, static_cast<float>(L.win.top), down ? lag : lead);
+    float y1 = edge(icy + bead / 2, static_cast<float>(L.win.bottom), down ? lead : lag);
+    const float mx = (x0 + x1) / 2, my = (y0 + y1) / 2, hw = (x1 - x0) / 2 * (1 + wob), hv = (y1 - y0) / 2 * (1 - wob); // jelly
+    const float sw = std::max(2.f, 2 * hw), sh = std::max(2.f, 2 * hv);
+    const float grow = Clamp01((sw - bead) / std::max(1.f, W - bead));
+
+    LqShape f;
+    f.r = std::min(bead / 2.f + (L.radius - bead / 2.f) * grow, std::min(sw, sh) / 2.f);
+    f.x0 = mx - sw / 2; f.y0 = my - sh / 2; f.x1 = mx + sw / 2; f.y1 = my + sh / 2;
+    f.icx = icx; f.icy = icy;
+    f.nr = bead / 2.f * (1.f - LqSmooth(0.12f, 0.5f, s));      // the bead stays behind a moment, then drains away
+    f.k = 34.f * (1.f - LqSmooth(0.f, 0.5f, s)) + 2.f;         // the bridge: gooey at first, then it snaps
+    f.content = LqSmooth(0.32f, 0.9f, s);
+    f.fade = LqSmooth(0.f, 0.08f, s);
+    f.top = std::min(f.y0, icy - f.nr);
+    f.span = std::max(1.f, std::max(f.y1, icy + f.nr) - f.top);
+    f.su = W / sw; f.sv = H / sh;
+    COLORREF tint = RGB(g_glassCfg.tintR, g_glassCfg.tintG, g_glassCfg.tintB);
+    f.vr = GetRValue(tint) * 0.3f + 14; f.vg = GetGValue(tint) * 0.3f + 14; f.vb = GetBValue(tint) * 0.3f + 18;
+    if (t >= 1.f && L.opening) { f.content = 1.f; f.nr = 0.f; }
+
+    RECT bb{ static_cast<LONG>(std::floor(std::min(f.x0, icx - f.nr) - 4)), static_cast<LONG>(std::floor(std::min(f.y0, icy - f.nr) - 4)),
+             static_cast<LONG>(std::ceil(std::max(f.x1, icx + f.nr) + 4)), static_cast<LONG>(std::ceil(std::max(f.y1, icy + f.nr) + 4)) };
+    bb.left = std::max(0L, bb.left); bb.top = std::max(0L, bb.top);
+    bb.right = std::min(static_cast<LONG>(c.w), bb.right); bb.bottom = std::min(static_cast<LONG>(c.h), bb.bottom);
+    f.bb = bb;
+
+    // the rows are split across the CPU's cores
+    static const int cores = [] { SYSTEM_INFO si; GetSystemInfo(&si); return std::max(1, std::min(8, static_cast<int>(si.dwNumberOfProcessors))); }();
+    const LONG rows = bb.bottom - bb.top;
+    const int n = rows * (bb.right - bb.left) > 40000 ? cores : 1;
+    LqJob jobs[8];
+    HANDLE th[8];
+    int started = 0;
+    for (int i = 0; i < n; ++i) {
+        jobs[i] = { &f, bb.top + rows * i / n, bb.top + rows * (i + 1) / n };
+        if (i == n - 1) break; // the last slice runs right here
+        if ((th[started] = CreateThread(nullptr, 0, LqRowsThread, &jobs[i], 0, nullptr))) ++started;
+        else LqRows(f, jobs[i].ya, jobs[i].yb);
+    }
+    LqRows(f, jobs[n - 1].ya, jobs[n - 1].yb);
+    if (started) WaitForMultipleObjects(started, th, TRUE, INFINITE);
+    for (int i = 0; i < started; ++i) CloseHandle(th[i]);
+
+    RECT dr;
+    UnionRect(&dr, &L.dirty, &bb);
+    if (L.first) { dr = { 0, 0, c.w, c.h }; L.first = false; }
+    L.dirty = bb;
+    POINT src{ 0, 0 };
+    SIZE sz{ c.w, c.h };
+    BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    UPDATELAYEREDWINDOWINFO info{};
+    info.cbSize = sizeof(info);
+    info.hdcSrc = L.s.dc;
+    info.pptDst = &L.org;
+    info.psize = &sz;
+    info.pptSrc = &src;
+    info.pblend = &bf;
+    info.dwFlags = ULW_ALPHA;
+    info.prcDirty = &dr; // only the part that changed
+    UpdateLayeredWindowIndirect(L.wnd, &info);
+}
+
+// Ends the running drop at once: an opening window is shown, a closing one is gone.
+void LqFinish() {
+    if (!g_lq.start) return;
+    g_lq.start = 0;
+    KillTimer(g_lq.wnd, LQ_TIMER);
+    auto done = std::move(g_lq.done);
+    g_lq.done = nullptr;
+    if (done) done();               // the real window first, then the overlay goes: no flicker
+    ShowWindow(g_lq.wnd, SW_HIDE);
+}
+
+LRESULT CALLBACK LqProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    if (msg == WM_TIMER && w == LQ_TIMER && g_lq.start) {
+        float t = (GetTickCount() - g_lq.start) / static_cast<float>(g_lq.dur);
+        LqFrame(std::min(1.f, t));
+        if (t >= 1.f) LqFinish();
+        return 0;
+    }
+    if (msg == WM_NCHITTEST) return HTTRANSPARENT;
+    return DefWindowProcW(h, msg, w, l);
+}
+
+bool LiquidWanted(const RECT& icon) { return g_glassCfg.liquidAnim && !IsRectEmpty(&icon); }
+
+// Pours `win`'s picture (w x h at `at` on screen) out of `icon` (opening) or back into it.
+// `done` runs when the drop has become the window. false = animations off: do it plainly.
+bool LiquidRun(const Surface& win, int w, int h, POINT at, RECT icon, float radius, bool opening, std::function<void()> done) {
+    if (!LiquidWanted(icon) || !win.px || w <= 0 || h <= 0) return false;
+    LqFinish();
+    Liquid& L = g_lq;
+    if (!L.wnd) {
+        WNDCLASSW wc{};
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpfnWndProc = LqProc;
+        wc.lpszClassName = L"REICOLiquid";
+        RegisterClassW(&wc);
+        L.wnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, L"REICOLiquid",
+                                L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
+        if (!L.wnd) return false;
+    }
+    RECT wr{ at.x, at.y, at.x + w, at.y + h }, u;
+    UnionRect(&u, &wr, &icon);
+    InflateRect(&u, w / 10 + 16, h / 10 + 16); // room for the spring's overshoot
+    if (!SurfCreate(L.s, u.right - u.left, u.bottom - u.top)) return false;
+    L.org = { u.left, u.top };
+    L.win = { wr.left - u.left, wr.top - u.top, wr.right - u.left, wr.bottom - u.top };
+    L.icon = { icon.left - u.left, icon.top - u.top, icon.right - u.left, icon.bottom - u.top };
+    L.snap.assign(win.px, win.px + static_cast<size_t>(w) * h);
+    L.w = w;
+    L.h = h;
+    L.radius = radius;
+    L.opening = opening;
+    L.dur = opening ? 430 : 280;
+    L.dirty = {};
+    L.first = true;
+    L.done = std::move(done);
+    L.start = GetTickCount();
+    LqFrame(0.f);
+    SetWindowPos(L.wnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetTimer(L.wnd, LQ_TIMER, 10, nullptr);
+    return true;
+}
+
 void DrawLogo(Canvas c, Surface& mask, float x, float y, float size, HFONT font) {
     COLORREF acc = AccentColour();
     auto shade = [&](float k) {
@@ -3063,7 +3316,7 @@ enum PanelCtlKind { CK_ACTION, CK_TOGGLE, CK_SLIDER, CK_SWATCH, CK_SEGMENT, CK_C
 enum {
     P_REFRESH = 1, P_EDIT, P_GLASS, P_LIQUID, P_ICONGLASS, P_ICONTINT,
     P_TINTA, P_WALPHA, P_GLASSAMT, P_BRIGHT, P_EDGE, P_HOVER, P_SETTINGS, P_EXIT, P_NOWPLAY, P_DOCK, P_BTNGAMES, P_BTNTASK, P_BTNNOTES,
-    P_DOWNLOADS, P_WHEEL, P_TINTV,
+    P_DOWNLOADS, P_BTNCONV, P_LIQUIDANIM, P_WHEEL, P_TINTV,
     P_SWATCH = 100, P_PRESET = 200,
 };
 
@@ -3078,7 +3331,7 @@ struct PanelCtl {
 };
 
 struct PanelVals {
-    bool liquid, iconGlass, iconTint, nowPlaying, dock, btnGames, btnTaskMgr, btnNotes, downloads;
+    bool liquid, iconGlass, iconTint, nowPlaying, dock, btnGames, btnTaskMgr, btnNotes, btnConvert, downloads, liquidAnim;
     int tintA, wAlpha, glassAmt, bright, edge, hover;
     COLORREF tint;
     float hue, sat;  // tint as hue (0..360) + saturation (0..1), for the colour wheel
@@ -3142,7 +3395,9 @@ void PanelLoadVals() {
     g_pv.btnGames = g_glassCfg.btnGames;
     g_pv.btnTaskMgr = g_glassCfg.btnTaskMgr;
     g_pv.btnNotes = g_glassCfg.btnNotes;
+    g_pv.btnConvert = g_glassCfg.btnConvert;
     g_pv.downloads = g_glassCfg.downloads;
+    g_pv.liquidAnim = g_glassCfg.liquidAnim;
     g_pv.tintA = g_glassCfg.tintAlpha;
     g_pv.wAlpha = g_glassCfg.windowAlpha;
     g_pv.glassAmt = g_glassCfg.iconGlassAmount;
@@ -3177,7 +3432,9 @@ bool* PanelToggleVal(int id) {
     case P_BTNGAMES: return &g_pv.btnGames;
     case P_BTNTASK: return &g_pv.btnTaskMgr;
     case P_BTNNOTES: return &g_pv.btnNotes;
+    case P_BTNCONV: return &g_pv.btnConvert;
     case P_DOWNLOADS: return &g_pv.downloads;
+    case P_LIQUIDANIM: return &g_pv.liquidAnim;
     }
     return nullptr;
 }
@@ -3201,7 +3458,9 @@ void PanelApply() {
         { "btnGames", b(g_pv.btnGames) },
         { "btnTaskMgr", b(g_pv.btnTaskMgr) },
         { "btnNotes", b(g_pv.btnNotes) },
+        { "btnConvert", b(g_pv.btnConvert) },
         { "downloads", b(g_pv.downloads) },
+        { "liquidAnim", b(g_pv.liquidAnim) },
     });
     ReloadConfig();
     UiFromConfig();
@@ -3257,11 +3516,13 @@ void PanelLayout() {
     add(CK_SEGMENT, P_HOVER, { L2, y, R2, y + 30 }, L""); y += 30 + 16;
 
     add(CK_SECTION, 0, { L2, y, R2, y + 16 }, L"EXTRAS"); y += 22;
+    add(CK_TOGGLE, P_LIQUIDANIM, { L2, y, R2, y + 28 }, L"Liquid animations"); y += 32;
     add(CK_TOGGLE, P_NOWPLAY, { L2, y, R2, y + 28 }, L"Now playing pop-up"); y += 32;
     add(CK_TOGGLE, P_DOCK, { L2, y, R2, y + 28 }, L"Glass taskbar (top)"); y += 32;
     add(CK_TOGGLE, P_BTNGAMES, { L2, y, R2, y + 28 }, L"Game launcher button"); y += 32;
     add(CK_TOGGLE, P_BTNTASK, { L2, y, R2, y + 28 }, L"Task Manager button"); y += 32;
     add(CK_TOGGLE, P_BTNNOTES, { L2, y, R2, y + 28 }, L"Board button"); y += 32;
+    add(CK_TOGGLE, P_BTNCONV, { L2, y, R2, y + 28 }, L"Converter button"); y += 32;
     add(CK_TOGGLE, P_DOWNLOADS, { L2, y, R2, y + 28 }, L"Download manager"); y += 34 + 10;
 
     add(CK_SECTION, 0, { L2, y, R2, y + 16 }, L"PRESETS"); y += 22;
@@ -3622,17 +3883,27 @@ void PanelTick() {
     if (!moving) { KillTimer(g_panel, PANEL_ANIM_TIMER_ID); g_pnlTimerOn = false; }
 }
 
+RECT g_pnlFrom{}; // around the click that opened it
+
 void PanelClose() {
     if (!g_pnlVisible || g_pnlClosing) return;
     if (g_pnlDrag >= 0) { ReleaseCapture(); g_pnlDrag = -1; }
-    g_pnlClosing = true;
     g_pnlAnimStart = GetTickCount();
     g_pnlLastClose = g_pnlAnimStart;
+    if (LiquidRun(g_pnl, PANEL_W, g_pnlH, POINT{ g_pnlX, g_pnlY }, g_pnlFrom, PANEL_R, false, nullptr)) {
+        ShowWindow(g_panel, SW_HIDE);
+        g_pnlVisible = false;
+        KillTimer(g_panel, PANEL_ANIM_TIMER_ID);
+        g_pnlTimerOn = false;
+        return;
+    }
+    g_pnlClosing = true;
     PanelKick();
 }
 
 void PanelOpen() {
     if (!g_panel) return;
+    LqFinish(); // a drop still running mustn't end up in the backdrop capture either
     if (g_pnlVisible) ShowWindow(g_panel, SW_HIDE); // so the backdrop capture doesn't include us
 
     PanelLoadVals();
@@ -3642,6 +3913,7 @@ void PanelOpen() {
     // above the tray, wherever the taskbar is
     POINT c;
     GetCursorPos(&c);
+    g_pnlFrom = { c.x - 16, c.y - 16, c.x + 16, c.y + 16 };
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
     GetMonitorInfoW(MonitorFromPoint(c, MONITOR_DEFAULTTONEAREST), &mi);
@@ -3659,12 +3931,12 @@ void PanelOpen() {
 
     g_pnlVisible = true;
     g_pnlClosing = false;
-    g_pnlOpenT = 0.f;
-    g_pnlAnimStart = GetTickCount();
+    bool liquid = LiquidWanted(g_pnlFrom);
+    g_pnlOpenT = liquid ? 1.f : 0.f;
+    g_pnlAnimStart = GetTickCount() - (liquid ? 1000 : 0);
     PanelPresent();
-    ShowWindow(g_panel, SW_SHOW);
-    SetForegroundWindow(g_panel); // needed so clicking elsewhere closes it
-    PanelKick();
+    auto show = [] { ShowWindow(g_panel, SW_SHOW); SetForegroundWindow(g_panel); PanelKick(); }; // focus: clicking elsewhere closes it
+    if (!liquid || !LiquidRun(g_pnl, PANEL_W, g_pnlH, POINT{ g_pnlX, g_pnlY }, g_pnlFrom, PANEL_R, true, show)) show();
 }
 
 void PanelOnReload() {
@@ -4591,12 +4863,12 @@ const int DOCK_TOP = 7, DOCK_H = 52, DOCK_R = 22;
 const int DOCK_SLOT = 46, DOCK_ICON = 32, DOCK_PAD = 10;
 const int DOCK_SEP = 12, DOCK_TRAY_W = 36, DOCK_CLOCK_W = 80;
 const int DOCK_SIDE_X = 12;             // the round buttons start at the top-left of the strip
-enum { SIDE_GAMES, SIDE_TASKMGR, SIDE_NOTES };
+enum { SIDE_GAMES, SIDE_TASKMGR, SIDE_NOTES, SIDE_CONVERT };
 
-// x of a top-left button (game launcher, Task Manager, board), or -1 when it's turned
+// x of a top-left button (game launcher, Task Manager, board, converter), or -1 when it's turned
 // off in the settings; the ones that are on are packed left to right.
 int DockSideX(int which) {
-    const bool on[3] = { g_glassCfg.btnGames, g_glassCfg.btnTaskMgr, g_glassCfg.btnNotes };
+    const bool on[4] = { g_glassCfg.btnGames, g_glassCfg.btnTaskMgr, g_glassCfg.btnNotes, g_glassCfg.btnConvert };
     if (!on[which]) return -1;
     int x = DOCK_SIDE_X;
     for (int i = 0; i < which; ++i) if (on[i]) x += DOCK_H + 8;
@@ -4604,7 +4876,7 @@ int DockSideX(int which) {
 }
 const UINT WM_DOCK_APPBAR = WM_APP + 30;
 const UINT_PTR DOCK_ANIM_TIMER = 1, DOCK_TICK_TIMER = 2, DOCK_REFRESH_TIMER = 3;
-enum { DH_NONE = -1, DH_START = 1000, DH_TRAY, DH_CLOCK, DH_GAMES, DH_TASKMGR, DH_NOTES };
+enum { DH_NONE = -1, DH_START = 1000, DH_TRAY, DH_CLOCK, DH_GAMES, DH_TASKMGR, DH_NOTES, DH_CONVERT };
 const wchar_t* TASKBAR_STATE_FILE = L"C:\\REICO\\taskbar_state.txt";
 
 struct DockApp {
@@ -4622,14 +4894,22 @@ struct DockApp {
 };
 
 HWND g_dock = nullptr;
+
 bool g_dockOn = false, g_dockAppbar = false, g_dockHidden = false, g_dockTimerOn = false;
 Surface g_dockS, g_dockMask;
 std::vector<DockApp> g_dockApps;
 RECT g_dockMon{};
 POINT g_dockOrigin{};
+
+// Where a top-left button is on screen (empty when the dock or the button is off).
+RECT DockSideRect(int which) {
+    int x = DockSideX(which);
+    if (!g_dock || x < 0) return RECT{};
+    return { g_dockOrigin.x + x, g_dockOrigin.y + DOCK_TOP, g_dockOrigin.x + x + DOCK_H, g_dockOrigin.y + DOCK_TOP + DOCK_H };
+}
 float g_dockW = 0.f;
 int g_dockHot = DH_NONE;
-float g_dockStartHot = 0.f, g_dockTrayHot = 0.f, g_dockClockHot = 0.f, g_dockGamesHot = 0.f, g_dockTaskHot = 0.f, g_dockNotesHot = 0.f;
+float g_dockStartHot = 0.f, g_dockTrayHot = 0.f, g_dockClockHot = 0.f, g_dockGamesHot = 0.f, g_dockTaskHot = 0.f, g_dockNotesHot = 0.f, g_dockConvHot = 0.f;
 DWORD g_dockHoverSince = 0;
 HWINEVENTHOOK g_dockHookFg = nullptr, g_dockHookObj = nullptr;
 HFONT g_dockGlyphF = nullptr, g_dockTimeF = nullptr, g_dockDateF = nullptr, g_dockTipF = nullptr, g_dockGamesF = nullptr;
@@ -4888,6 +5168,7 @@ bool DockAnimate() {
     ease(g_dockGamesHot, g_dockHot == DH_GAMES ? 1.f : 0.f, 0.3f, 0.01f);
     ease(g_dockTaskHot, g_dockHot == DH_TASKMGR ? 1.f : 0.f, 0.3f, 0.01f);
     ease(g_dockNotesHot, g_dockHot == DH_NOTES ? 1.f : 0.f, 0.3f, 0.01f);
+    ease(g_dockConvHot, g_dockHot == DH_CONVERT ? 1.f : 0.f, 0.3f, 0.01f);
     ease(g_dockTrayHot, g_dockHot == DH_TRAY ? 1.f : 0.f, 0.3f, 0.01f);
     ease(g_dockClockHot, g_dockHot == DH_CLOCK ? 1.f : 0.f, 0.3f, 0.01f);
     if (g_dockHot >= 0 && GetTickCount() - g_dockHoverSince < 700) moving = true; // tooltip still on its way
@@ -4958,9 +5239,9 @@ void DockRender() {
     // the round glass buttons at the top-left: game launcher, Task Manager, board
     // (each can be turned off in the panel; the ones that are on pack left to right)
     {
-        const wchar_t glyphs[3][2] = { { 0xE7FC, 0 }, { 0xE9D9, 0 }, { 0xE70B, 0 } }; // controller, activity graph, note
-        const float hots[3] = { g_dockGamesHot, g_dockTaskHot, g_dockNotesHot };
-        for (int i = 0; i < 3; ++i) {
+        const wchar_t glyphs[4][2] = { { 0xE7FC, 0 }, { 0xE9D9, 0 }, { 0xE70B, 0 }, { 0xE8AB, 0 } }; // controller, activity graph, note, arrows
+        const float hots[4] = { g_dockGamesHot, g_dockTaskHot, g_dockNotesHot, g_dockConvHot };
+        for (int i = 0; i < 4; ++i) {
             int bx = DockSideX(i);
             if (bx < 0) continue;
             const float x0 = static_cast<float>(bx), x1 = x0 + DOCK_H;
@@ -5244,12 +5525,20 @@ void TpRender() {
 bool g_tpSticky = false, g_tpMouseWasDown = false;
 const UINT_PTR TP_WATCH_TIMER = 2;
 
+RECT g_tpFrom{}; // the tray button it opened from
+
 void TpClose() {
     if (!g_tpVisible || g_tpClosing) return;
-    g_tpClosing = true;
     g_tpSticky = false;
     KillTimer(g_tp, TP_WATCH_TIMER);
     g_tpAnimStart = g_tpLastClose = GetTickCount();
+    if (LiquidRun(g_tpS, g_tpW, g_tpH, POINT{ g_tpX, g_tpY }, g_tpFrom, TP_R, false, nullptr)) {
+        ShowWindow(g_tp, SW_HIDE);
+        g_tpVisible = false;
+        KillTimer(g_tp, TP_ANIM_TIMER);
+        return;
+    }
+    g_tpClosing = true;
     SetTimer(g_tp, TP_ANIM_TIMER, 15, nullptr);
 }
 
@@ -5356,11 +5645,13 @@ void TrayPopToggle(float buttonCenterX) {
     g_tpHot = g_tpPressed = -1;
     g_tpVisible = true;
     g_tpClosing = false;
-    g_tpAnimStart = GetTickCount();
+    g_tpFrom = { static_cast<LONG>(buttonCenterX) - DOCK_TRAY_W / 2, g_dockOrigin.y + DOCK_TOP,
+                 static_cast<LONG>(buttonCenterX) + DOCK_TRAY_W / 2, g_dockOrigin.y + DOCK_TOP + DOCK_H };
+    bool liquid = LiquidWanted(g_tpFrom);
+    g_tpAnimStart = GetTickCount() - (liquid ? 1000 : 0);
     TpRender();
-    ShowWindow(g_tp, SW_SHOW);
-    SetForegroundWindow(g_tp); // so clicking anywhere else closes it
-    SetTimer(g_tp, TP_ANIM_TIMER, 15, nullptr);
+    auto show = [] { ShowWindow(g_tp, SW_SHOW); SetForegroundWindow(g_tp); SetTimer(g_tp, TP_ANIM_TIMER, 15, nullptr); }; // focus: a click elsewhere closes it
+    if (!liquid || !LiquidRun(g_tpS, g_tpW, g_tpH, POINT{ g_tpX, g_tpY }, g_tpFrom, TP_R, true, show)) show();
 }
 
 // ---- glass calendar (drops down under the clock) ----------------------------
@@ -5475,10 +5766,19 @@ int CalHit(POINT p) {
     return CALH_NONE;
 }
 
+RECT g_calFrom{}; // the clock it opened from
+
 void CalClose() {
     if (!g_calVisible || g_calClosing) return;
-    g_calClosing = true;
     g_calAnimStart = g_calLastClose = GetTickCount();
+    if (LiquidRun(g_calS, CAL_W, CAL_H, POINT{ g_calX, g_calY }, g_calFrom, 20, false, nullptr)) {
+        ShowWindow(g_cal, SW_HIDE);
+        KillTimer(g_cal, CAL_ANIM_TIMER);
+        KillTimer(g_cal, CAL_TICK_TIMER);
+        g_calVisible = false;
+        return;
+    }
+    g_calClosing = true;
     SetTimer(g_cal, CAL_ANIM_TIMER, 15, nullptr);
 }
 
@@ -5555,12 +5855,18 @@ void CalToggle(float buttonCenterX) {
     g_calY = g_dockOrigin.y + DOCK_TOP + DOCK_H + 10;
     g_calVisible = true;
     g_calClosing = false;
-    g_calAnimStart = GetTickCount();
+    g_calFrom = { static_cast<LONG>(buttonCenterX) - DOCK_CLOCK_W / 2, g_dockOrigin.y + DOCK_TOP,
+                  static_cast<LONG>(buttonCenterX) + DOCK_CLOCK_W / 2, g_dockOrigin.y + DOCK_TOP + DOCK_H };
+    bool liquid = LiquidWanted(g_calFrom);
+    g_calAnimStart = GetTickCount() - (liquid ? 1000 : 0);
     CalRender();
-    ShowWindow(g_cal, SW_SHOW);
-    SetForegroundWindow(g_cal);
-    SetTimer(g_cal, CAL_ANIM_TIMER, 15, nullptr);
-    SetTimer(g_cal, CAL_TICK_TIMER, 1000, nullptr);
+    auto show = [] {
+        ShowWindow(g_cal, SW_SHOW);
+        SetForegroundWindow(g_cal);
+        SetTimer(g_cal, CAL_ANIM_TIMER, 15, nullptr);
+        SetTimer(g_cal, CAL_TICK_TIMER, 1000, nullptr);
+    };
+    if (!liquid || !LiquidRun(g_calS, CAL_W, CAL_H, POINT{ g_calX, g_calY }, g_calFrom, 20, true, show)) show();
 }
 
 // Start button: the Windows logo as four glass panes.
@@ -6020,8 +6326,14 @@ void GlKick() { if (g_gl) SetTimer(g_gl, GL_ANIM_TIMER, 15, nullptr); }
 
 void GlClose() {
     if (!g_glVisible || g_glClosing) return;
-    g_glClosing = true;
     g_glAnimStart = g_glLastClose = GetTickCount();
+    if (LiquidRun(g_glS, GL_W, GL_H, POINT{ g_glX, g_glY }, DockSideRect(SIDE_GAMES), 22, false, nullptr)) { // pours back into its button
+        ShowWindow(g_gl, SW_HIDE);
+        g_glVisible = false;
+        KillTimer(g_gl, GL_ANIM_TIMER);
+        return;
+    }
+    g_glClosing = true;
     GlKick();
 }
 
@@ -6274,11 +6586,12 @@ void GameLauncherToggle() {
     g_glY = g_dockOrigin.y + DOCK_TOP + DOCK_H + 10;
     g_glVisible = true;
     g_glClosing = false;
-    g_glAnimStart = GetTickCount();
+    RECT from = DockSideRect(SIDE_GAMES);
+    bool liquid = LiquidWanted(from);
+    g_glAnimStart = GetTickCount() - (liquid ? 1000 : 0); // with the liquid drop, the window itself appears fully open
     GlRender();
-    ShowWindow(g_gl, SW_SHOW);
-    SetForegroundWindow(g_gl); // keyboard search + close on click-away
-    GlKick();
+    auto show = [] { ShowWindow(g_gl, SW_SHOW); SetForegroundWindow(g_gl); GlKick(); }; // keyboard search + close on click-away
+    if (!liquid || !LiquidRun(g_glS, GL_W, GL_H, POINT{ g_glX, g_glY }, from, 22, true, show)) show();
 }
 
 // ---- the board (notes button): photos, notes and bucket lists ---------------
@@ -6882,8 +7195,14 @@ void BdClose() {
     }
     BdFocus(-1);
     BdSave();
-    g_bdClosing = true;
     g_bdAnimStart = GetTickCount();
+    if (LiquidRun(g_bdS, g_bdW, g_bdH, POINT{ g_bdX, g_bdY }, DockSideRect(SIDE_NOTES), 26, false, nullptr)) {
+        ShowWindow(g_bdWnd, SW_HIDE);
+        g_bdVisible = false;
+        KillTimer(g_bdWnd, BD_ANIM_TIMER);
+        return;
+    }
+    g_bdClosing = true;
     BdKick();
 }
 
@@ -7054,11 +7373,12 @@ void BoardToggle() {
     BdFocus(-1);
     g_bdVisible = true;
     g_bdClosing = false;
-    g_bdAnimStart = GetTickCount();
+    RECT from = DockSideRect(SIDE_NOTES);
+    bool liquid = LiquidWanted(from);
+    g_bdAnimStart = GetTickCount() - (liquid ? 1000 : 0);
     BdRender();
-    ShowWindow(g_bdWnd, SW_SHOW);
-    SetForegroundWindow(g_bdWnd);
-    BdKick();
+    auto show = [] { ShowWindow(g_bdWnd, SW_SHOW); SetForegroundWindow(g_bdWnd); BdKick(); };
+    if (!liquid || !LiquidRun(g_bdS, g_bdW, g_bdH, POINT{ g_bdX, g_bdY }, from, 26, true, show)) show();
 }
 
 void BoardShutdown() {
@@ -7277,7 +7597,7 @@ void DlLoadDir() {
     }
 }
 
-bool DlPickFolder(std::wstring& dir) {
+bool DlPickFolder(std::wstring& dir, HWND owner = nullptr, const wchar_t* title = L"Save the download to") {
     static const CLSID kFileOpenDialog = { 0xDC1C5A9C, 0xE88A, 0x4DDE, { 0xA5, 0xA1, 0x60, 0xF8, 0x2A, 0x20, 0xAE, 0xF7 } };
     static const IID kIFileOpenDialog = { 0xD57C7288, 0xD4AD, 0x4768, { 0xBE, 0x02, 0x9D, 0x96, 0x95, 0x32, 0xD9, 0x60 } };
     static const IID kIShellItem = { 0x43826D1E, 0xE718, 0x42EE, { 0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B, 0xFE } };
@@ -7295,7 +7615,7 @@ bool DlPickFolder(std::wstring& dir) {
     DWORD o = 0;
     fd->GetOptions(&o);
     fd->SetOptions(o | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
-    fd->SetTitle(L"Save the download to");
+    fd->SetTitle(title);
     IShellItem* start = nullptr;
     if (SUCCEEDED(SHCreateItemFromParsingName(dir.c_str(), nullptr, kIShellItem, reinterpret_cast<void**>(&start)))) {
         fd->SetFolder(start);
@@ -7303,7 +7623,7 @@ bool DlPickFolder(std::wstring& dir) {
     }
     bool ok = false;
     IShellItem* it = nullptr;
-    if (SUCCEEDED(fd->Show(g_dlWnd)) && SUCCEEDED(fd->GetResult(&it))) {
+    if (SUCCEEDED(fd->Show(owner ? owner : g_dlWnd)) && SUCCEEDED(fd->GetResult(&it))) {
         PWSTR p = nullptr;
         if (SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &p)) && p) { dir = p; coFree(p); ok = true; }
         it->Release();
@@ -7967,9 +8287,763 @@ int DlHostMain() {
     return 0;
 }
 
+// ---- converter (round button): drop files on a box, they come out converted ---------
+//
+// Four glass boxes: Images, Video & audio, 3D models, Pages. Drop files on a box (or
+// click it to pick them), choose the output format on its chips, and they're converted
+// one after another into the folder chosen at the bottom.
+// Images are converted right here with Windows' own codecs (WIC; WebP output via ffmpeg).
+// Everything else goes to a free tool that runs hidden - no window, below-normal
+// priority, one file at a time - and exits as soon as its file is written: ffmpeg for
+// video/audio, Blender in background mode for 3D models, LibreOffice headless for
+// documents. A job object ties those to REICO, so closing REICO stops them too.
+
+enum { CB_IMAGE, CB_MEDIA, CB_MODEL, CB_PAGES, CB_COUNT };
+struct CvBox {
+    const wchar_t* title;
+    const wchar_t* glyph;
+    const wchar_t* inputs;                 // shown under the title
+    std::vector<const wchar_t*> formats;   // output extensions
+    const wchar_t* filter;                 // file picker filter
+    const wchar_t* tool;                   // the free tool it needs (nullptr = built in)
+    const wchar_t* wingetId;               // how the Install button gets it
+    int fmt = 0;                           // chosen output (UI thread)
+    int total = 0, done = 0, failed = 0;   // this batch (under g_cvCs)
+    std::wstring current, error;
+};
+CvBox g_cvBox[CB_COUNT] = {
+    { L"Images", L"\uE8B9", L"PNG \u00B7 JPG \u00B7 HEIC \u00B7 WEBP \u00B7 BMP \u00B7 TIFF \u00B7 GIF \u00B7 ICO",
+      { L"png", L"jpg", L"webp", L"bmp", L"tiff", L"gif", L"ico", L"pdf" },
+      L"Images\0*.png;*.jpg;*.jpeg;*.heic;*.heif;*.webp;*.bmp;*.tif;*.tiff;*.gif;*.ico;*.jxr;*.dds\0All files\0*.*\0", nullptr, nullptr },
+    { L"Video & audio", L"\uE714", L"MP4 \u00B7 MKV \u00B7 MOV \u00B7 AVI \u00B7 WEBM \u00B7 MP3 \u00B7 WAV \u00B7 FLAC \u00B7 M4A",
+      { L"mp4", L"mkv", L"webm", L"mov", L"gif", L"mp3", L"wav", L"m4a" },
+      L"Video and audio\0*.mp4;*.mkv;*.mov;*.avi;*.webm;*.wmv;*.flv;*.m4v;*.gif;*.mp3;*.wav;*.flac;*.m4a;*.aac;*.ogg;*.opus;*.wma\0All files\0*.*\0",
+      L"ffmpeg", L"Gyan.FFmpeg" },
+    { L"3D models", L"\uF158", L"OBJ \u00B7 FBX \u00B7 GLB \u00B7 GLTF \u00B7 STL \u00B7 PLY \u00B7 USD \u00B7 ABC \u00B7 BLEND",
+      { L"obj", L"fbx", L"glb", L"stl", L"ply", L"usd" },
+      L"3D models\0*.obj;*.fbx;*.glb;*.gltf;*.stl;*.ply;*.usd;*.usda;*.usdc;*.usdz;*.abc;*.blend\0All files\0*.*\0",
+      L"Blender", L"BlenderFoundation.Blender" },
+    { L"Pages", L"\uE7C3", L"DOCX \u00B7 DOC \u00B7 ODT \u00B7 RTF \u00B7 TXT \u00B7 PDF \u00B7 PPTX \u00B7 XLSX \u00B7 images",
+      { L"pdf", L"docx", L"odt", L"txt", L"html", L"rtf" },
+      L"Documents and images\0*.docx;*.doc;*.odt;*.rtf;*.txt;*.pdf;*.html;*.htm;*.pptx;*.ppt;*.odp;*.xlsx;*.xls;*.ods;*.csv;*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff;*.gif;*.heic;*.webp\0All files\0*.*\0",
+      L"LibreOffice", L"TheDocumentFoundation.LibreOffice" },
+};
+
+struct CvJob { int box; std::wstring src, ext, dir, tool, ffmpeg; };
+CRITICAL_SECTION g_cvCs;
+std::vector<CvJob> g_cvQueue;
+bool g_cvWorking = false;                  // under g_cvCs
+std::wstring g_cvDir;                      // where everything is saved
+std::wstring g_cvTools[CB_COUNT];          // found tools (UI thread), refreshed on open / when files are added
+const wchar_t* CV_TXT = L"C:\\REICO\\convert.txt"; // line 1: folder, line 2: chosen formats
+
+HWND g_cvWnd = nullptr;
+Surface g_cvS, g_cvMask;
+HFONT g_cvTitleF = nullptr, g_cvNameF = nullptr, g_cvSmallF = nullptr, g_cvChipF = nullptr, g_cvGlyphF = nullptr, g_cvBigGlyphF = nullptr;
+int g_cvX = 0, g_cvY = 0, g_cvHot = 0, g_cvPressed = 0;
+bool g_cvVisible = false, g_cvMoving = false;
+POINT g_cvMoveOff{};
+DWORD g_cvOpenedAt = 0;
+struct CvHit { RECT r; int id; };
+std::vector<CvHit> g_cvHits;
+const UINT_PTR CV_TIMER = 1;
+const int CV_W = 860, CV_H = 600, CV_PAD = 20, CV_HEAD = 72, CV_BOX_W = (CV_W - 2 * CV_PAD - 14) / 2, CV_BOX_H = 214;
+// hit ids: box*100 + 1 = the box (pick files), + 10 + i = format chip i, + 90 = Install
+enum { CVH_NONE = 0, CVH_CLOSE = 1000, CVH_CHANGE, CVH_OPEN, CVH_HEAD };
+
+// -- finding the tools --
+
+// Searches what PATH says *now* (REICO's own copy is from when it started, before an install).
+std::wstring CvFindOnPath(const wchar_t* exe) {
+    std::wstring dirs;
+    for (auto root : { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE }) {
+        std::wstring p = RegString(root, root == HKEY_CURRENT_USER ? L"Environment"
+                                         : L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", L"Path");
+        wchar_t ex[8192];
+        if (!p.empty() && ExpandEnvironmentStringsW(p.c_str(), ex, 8192)) dirs += std::wstring(ex) + L";";
+    }
+    wchar_t own[8192];
+    if (GetEnvironmentVariableW(L"PATH", own, 8192)) dirs += own;
+    for (size_t a = 0, b; a < dirs.size(); a = b + 1) {
+        b = dirs.find(L';', a);
+        if (b == std::wstring::npos) b = dirs.size();
+        std::wstring d = dirs.substr(a, b - a);
+        if (d.empty()) continue;
+        std::wstring f = d + (d.back() == L'\\' ? L"" : L"\\") + exe;
+        if (GetFileAttributesW(f.c_str()) != INVALID_FILE_ATTRIBUTES) return f;
+    }
+    return L"";
+}
+
+// The newest match of dir\*\rest (e.g. Blender Foundation\Blender 5.2\blender.exe).
+std::wstring CvNewest(const std::wstring& dir, const std::wstring& rest) {
+    std::wstring best;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+        std::wstring f = e.path().wstring() + L"\\" + rest;
+        if (GetFileAttributesW(f.c_str()) != INVALID_FILE_ATTRIBUTES && f > best) best = f;
+    }
+    return best;
+}
+
+std::wstring CvTool(int box) {
+    wchar_t local[MAX_PATH] = L"";
+    GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (box == CB_MEDIA || box == CB_IMAGE) {
+        if (GetFileAttributesW(L"C:\\REICO\\tools\\ffmpeg.exe") != INVALID_FILE_ATTRIBUTES) return L"C:\\REICO\\tools\\ffmpeg.exe";
+        std::wstring f = CvFindOnPath(L"ffmpeg.exe");
+        if (f.empty()) { // winget's own folder: ...\WinGet\Packages\Gyan.FFmpeg_...\ffmpeg-x-full_build\bin\ffmpeg.exe
+            std::error_code ec;
+            for (const auto& e : fs::directory_iterator(std::wstring(local) + L"\\Microsoft\\WinGet\\Packages", ec))
+                if (e.path().filename().wstring().rfind(L"Gyan.FFmpeg", 0) == 0) f = CvNewest(e.path().wstring(), L"bin\\ffmpeg.exe");
+        }
+        return f;
+    }
+    if (box == CB_MODEL) {
+        std::wstring f = CvNewest(L"C:\\Program Files\\Blender Foundation", L"blender.exe");
+        if (f.empty() && GetFileAttributesW(L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Blender\\blender.exe") != INVALID_FILE_ATTRIBUTES)
+            f = L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Blender\\blender.exe";
+        return f.empty() ? CvFindOnPath(L"blender.exe") : f;
+    }
+    if (box == CB_PAGES)
+        for (const wchar_t* f : { L"C:\\Program Files\\LibreOffice\\program\\soffice.com", L"C:\\Program Files (x86)\\LibreOffice\\program\\soffice.com" })
+            if (GetFileAttributesW(f) != INVALID_FILE_ATTRIBUTES) return f;
+    return L"";
+}
+
+// -- the conversions (worker thread) --
+
+// Runs a tool hidden and waits for it. On failure, `err` = the last line it printed.
+bool CvRun(std::wstring cmd, std::wstring& err) {
+    static HANDLE job = [] {
+        HANDLE j = CreateJobObjectW(nullptr, nullptr);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE; // REICO closes -> the tool stops
+        if (j) SetInformationJobObject(j, JobObjectExtendedLimitInformation, &li, sizeof(li));
+        return j;
+    }();
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring logPath = std::wstring(tmp) + L"reico_convert.log";
+    SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
+    HANDLE log = CreateFileW(logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS, 0, nullptr);
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = si.hStdError = log;
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS | CREATE_SUSPENDED,
+                             nullptr, nullptr, &si, &pi);
+    if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
+    if (!ok) { err = L"couldn't start the converter"; return false; }
+    if (job) AssignProcessToJobObject(job, pi.hProcess);
+    ResumeThread(pi.hThread);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    if (code == 0) return true;
+    std::wstring t = ReadTextFile(logPath), line;
+    std::wstringstream ss(t);
+    for (std::wstring l; std::getline(ss, l);) {
+        while (!l.empty() && iswspace(l.back())) l.pop_back();
+        if (!l.empty()) line = l;
+    }
+    err = line.empty() ? L"the converter failed" : line.substr(0, 160);
+    return false;
+}
+
+const GUID CV_BGRA = { 0x6fddc324, 0x4e03, 0x4bfe, { 0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x0f } };
+const GUID CV_BGR = { 0x6fddc324, 0x4e03, 0x4bfe, { 0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x0c } };
+const GUID CV_INDEXED8 = { 0x6fddc324, 0x4e03, 0x4bfe, { 0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x04 } };
+const GUID CV_PNG = { 0x1b7cfaf4, 0x713f, 0x473c, { 0xbb, 0xcd, 0x61, 0x37, 0x42, 0x5f, 0xae, 0xaf } };
+const GUID CV_JPEG = { 0x19e4a5aa, 0x5662, 0x4fc5, { 0xa0, 0xc0, 0x17, 0x58, 0x02, 0x8e, 0x10, 0x57 } };
+const GUID CV_BMP = { 0x0af1d87e, 0xfcfe, 0x4188, { 0xbd, 0xeb, 0xa7, 0x90, 0x64, 0x71, 0xcb, 0xe3 } };
+const GUID CV_TIFF = { 0x163bcc30, 0xe2e9, 0x4f0b, { 0x96, 0x1d, 0xa3, 0xe9, 0xfd, 0xb7, 0x88, 0xa3 } };
+const GUID CV_GIF = { 0x1f8a5601, 0x7d4d, 0x4cbd, { 0x9c, 0x82, 0x1b, 0xc8, 0xd4, 0xee, 0xb9, 0xa5 } };
+
+// Encodes straight-alpha BGRA pixels into `stream` (opaque: flattened on white, no alpha).
+bool CvEncode(IWICImagingFactory* wic, IStream* stream, const GUID& container, std::vector<UINT32> px, int w, int h, bool opaque) {
+    if (opaque)
+        for (auto& p : px) {
+            UINT32 a = p >> 24, k = 255 - a;
+            p = 0xFF000000 | ((((p >> 16) & 0xFF) * a / 255 + k) << 16) | ((((p >> 8) & 0xFF) * a / 255 + k) << 8) | ((p & 0xFF) * a / 255 + k);
+        }
+    IWICBitmapEncoder* enc = nullptr;
+    IWICBitmapFrameEncode* frame = nullptr;
+    IPropertyBag2* props = nullptr;
+    IWICBitmap* bmp = nullptr;
+    IWICPalette* pal = nullptr;
+    IWICFormatConverter* conv = nullptr;
+    bool ok = SUCCEEDED(wic->CreateEncoder(container, nullptr, &enc)) && SUCCEEDED(enc->Initialize(stream, WICBitmapEncoderNoCache)) &&
+              SUCCEEDED(enc->CreateNewFrame(&frame, &props));
+    if (ok && container == CV_JPEG) {
+        PROPBAG2 opt{};
+        opt.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
+        VARIANT v{};
+        v.vt = VT_R4;
+        v.fltVal = 0.92f;
+        props->Write(1, &opt, &v);
+    }
+    GUID fmt = opaque ? CV_BGR : CV_BGRA;
+    ok = ok && SUCCEEDED(frame->Initialize(props)) && SUCCEEDED(frame->SetSize(w, h)) && SUCCEEDED(frame->SetPixelFormat(&fmt)) &&
+         SUCCEEDED(wic->CreateBitmapFromMemory(w, h, CV_BGRA, w * 4, w * h * 4, reinterpret_cast<BYTE*>(px.data()), &bmp));
+    if (ok && fmt == CV_INDEXED8) { // GIF: 256 colours picked from the picture
+        ok = SUCCEEDED(wic->CreatePalette(&pal)) && SUCCEEDED(pal->InitializeFromBitmap(bmp, 256, TRUE)) &&
+             SUCCEEDED(frame->SetPalette(pal)) && SUCCEEDED(wic->CreateFormatConverter(&conv)) &&
+             SUCCEEDED(conv->Initialize(bmp, CV_INDEXED8, WICBitmapDitherTypeErrorDiffusion, pal, 0, WICBitmapPaletteTypeCustom)) &&
+             SUCCEEDED(frame->WriteSource(conv, nullptr));
+    } else if (ok) {
+        IWICFormatConverter* c2 = nullptr; // BGRA -> whatever the encoder settled on (e.g. 24-bit)
+        ok = SUCCEEDED(wic->CreateFormatConverter(&c2)) &&
+             SUCCEEDED(c2->Initialize(bmp, fmt, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom)) &&
+             SUCCEEDED(frame->WriteSource(c2, nullptr));
+        if (c2) c2->Release();
+    }
+    ok = ok && SUCCEEDED(frame->Commit()) && SUCCEEDED(enc->Commit());
+    for (IUnknown* u : std::initializer_list<IUnknown*>{ conv, pal, bmp, props, frame, enc }) if (u) u->Release();
+    return ok;
+}
+
+std::vector<BYTE> CvEncodeToMemory(IWICImagingFactory* wic, const GUID& container, const std::vector<UINT32>& px, int w, int h, bool opaque) {
+    typedef HRESULT (WINAPI *PFN_Create)(HGLOBAL, BOOL, LPSTREAM*);
+    typedef HRESULT (WINAPI *PFN_GetH)(LPSTREAM, HGLOBAL*);
+    HMODULE ole = LoadLibraryW(L"ole32.dll");
+    auto create = reinterpret_cast<PFN_Create>(reinterpret_cast<void*>(GetProcAddress(ole, "CreateStreamOnHGlobal")));
+    auto getH = reinterpret_cast<PFN_GetH>(reinterpret_cast<void*>(GetProcAddress(ole, "GetHGlobalFromStream")));
+    std::vector<BYTE> out;
+    IStream* st = nullptr;
+    if (!create || !getH || FAILED(create(nullptr, TRUE, &st))) return out;
+    HGLOBAL hg = nullptr;
+    STATSTG stat{};
+    if (CvEncode(wic, st, container, px, w, h, opaque) && SUCCEEDED(getH(st, &hg)) && SUCCEEDED(st->Stat(&stat, STATFLAG_NONAME))) {
+        out.resize(static_cast<size_t>(stat.cbSize.QuadPart));
+        memcpy(out.data(), GlobalLock(hg), out.size());
+        GlobalUnlock(hg);
+    }
+    st->Release();
+    return out;
+}
+
+// One page, the picture filling it (96 dpi), as a JPEG inside a minimal PDF.
+bool CvWritePdf(const std::wstring& dst, const std::vector<BYTE>& jpg, int w, int h) {
+    char num[64];
+    snprintf(num, 64, "%.2f %.2f", w * 0.75, h * 0.75);
+    std::string size = num, pdf = "%PDF-1.4\n", content = "q " + size.substr(0, size.find(' ')) + " 0 0 " + size.substr(size.find(' ') + 1) + " 0 0 cm /Im0 Do Q";
+    std::vector<size_t> at;
+    auto obj = [&](const std::string& body) { at.push_back(pdf.size()); pdf += std::to_string(at.size()) + " 0 obj\n" + body + "\nendobj\n"; };
+    obj("<< /Type /Catalog /Pages 2 0 R >>");
+    obj("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    obj("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " + size + "] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>");
+    obj("<< /Type /XObject /Subtype /Image /Width " + std::to_string(w) + " /Height " + std::to_string(h) +
+        " /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length " + std::to_string(jpg.size()) + " >>\nstream\n" +
+        std::string(jpg.begin(), jpg.end()) + "\nendstream");
+    obj("<< /Length " + std::to_string(content.size()) + " >>\nstream\n" + content + "\nendstream");
+    size_t xref = pdf.size();
+    pdf += "xref\n0 6\n0000000000 65535 f \n";
+    for (size_t o : at) { snprintf(num, 64, "%010zu 00000 n \n", o); pdf += num; }
+    pdf += "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n" + std::to_string(xref) + "\n%%EOF\n";
+    std::ofstream f(fs::path(dst), std::ios::binary);
+    f.write(pdf.data(), static_cast<std::streamsize>(pdf.size()));
+    return f.good();
+}
+
+bool CvImage(const std::wstring& src, const std::wstring& dst, const std::wstring& ext, std::wstring& err) {
+    typedef HRESULT (WINAPI *PFN_CoCreate)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
+    static PFN_CoCreate coCreate = reinterpret_cast<PFN_CoCreate>(
+        reinterpret_cast<void*>(GetProcAddress(LoadLibraryW(L"ole32.dll"), "CoCreateInstance")));
+    IWICImagingFactory* wic = nullptr;
+    IWICBitmapDecoder* dec = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* conv = nullptr;
+    UINT uw = 0, uh = 0;
+    std::vector<UINT32> px;
+    bool ok = coCreate && SUCCEEDED(coCreate(np::CLSID_WicFactory, nullptr, CLSCTX_INPROC_SERVER, np::IID_WicFactory, reinterpret_cast<void**>(&wic)));
+    if (ok && (FAILED(wic->CreateDecoderFromFilename(src.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)) ||
+               FAILED(dec->GetFrame(0, &frame)) || FAILED(frame->GetSize(&uw, &uh)) || !uw || !uh)) {
+        err = L"Windows can't read this picture";
+        ok = false;
+    }
+    ok = ok && SUCCEEDED(wic->CreateFormatConverter(&conv)) &&
+         SUCCEEDED(conv->Initialize(frame, CV_BGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom));
+    if (ok) {
+        px.resize(static_cast<size_t>(uw) * uh);
+        ok = SUCCEEDED(conv->CopyPixels(nullptr, uw * 4, uw * uh * 4, reinterpret_cast<BYTE*>(px.data())));
+    }
+    int w = static_cast<int>(uw), h = static_cast<int>(uh);
+    if (ok) {
+        if (ext == L"pdf") {
+            std::vector<BYTE> jpg = CvEncodeToMemory(wic, CV_JPEG, px, w, h, true);
+            ok = !jpg.empty() && CvWritePdf(dst, jpg, w, h);
+        } else if (ext == L"ico") { // one 256x256 (or smaller) PNG inside an .ico, picture centred
+            int s = std::min(256, std::max(w, h)), dw = std::max(1, w * s / std::max(w, h)), dh = std::max(1, h * s / std::max(w, h));
+            std::vector<UINT32> sq(static_cast<size_t>(s) * s, 0);
+            for (int y = 0; y < dh; ++y)
+                for (int x = 0; x < dw; ++x)
+                    sq[static_cast<size_t>(y + (s - dh) / 2) * s + x + (s - dw) / 2] = px[static_cast<size_t>(y * h / dh) * w + x * w / dw];
+            std::vector<BYTE> png = CvEncodeToMemory(wic, CV_PNG, sq, s, s, false);
+            if ((ok = !png.empty())) {
+                BYTE head[22] = { 0, 0, 1, 0, 1, 0, static_cast<BYTE>(s == 256 ? 0 : s), static_cast<BYTE>(s == 256 ? 0 : s), 0, 0, 1, 0, 32, 0 };
+                DWORD len = static_cast<DWORD>(png.size()), off = 22;
+                memcpy(head + 14, &len, 4);
+                memcpy(head + 18, &off, 4);
+                std::ofstream f(fs::path(dst), std::ios::binary);
+                f.write(reinterpret_cast<const char*>(head), 22);
+                f.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+                ok = f.good();
+            }
+        } else {
+            const GUID& c = ext == L"png" ? CV_PNG : ext == L"jpg" ? CV_JPEG : ext == L"bmp" ? CV_BMP : ext == L"tiff" ? CV_TIFF : CV_GIF;
+            IWICStream* st = nullptr;
+            ok = SUCCEEDED(wic->CreateStream(&st)) && SUCCEEDED(st->InitializeFromFilename(dst.c_str(), GENERIC_WRITE)) &&
+                 CvEncode(wic, st, c, px, w, h, ext == L"jpg" || ext == L"bmp" || ext == L"gif"); // gif: WIC drops its transparency
+            if (st) st->Release();
+        }
+        if (!ok && err.empty()) err = L"couldn't write the " + ext + L" file";
+    }
+    for (IUnknown* u : std::initializer_list<IUnknown*>{ conv, frame, dec, wic }) if (u) u->Release();
+    return ok;
+}
+
+const char* CV_BLENDER_PY =
+    "# REICO converter: Blender runs this in background mode (no window), then quits.\n"
+    "import bpy, os, sys\n"
+    "src, dst = sys.argv[sys.argv.index('--') + 1:][:2]\n"
+    "i, o = os.path.splitext(src)[1].lower(), os.path.splitext(dst)[1].lower()\n"
+    "if i == '.blend':\n"
+    "    bpy.ops.wm.open_mainfile(filepath=src)\n"
+    "else:\n"
+    "    bpy.ops.wm.read_factory_settings(use_empty=True)\n"
+    "    imp = {'.obj': bpy.ops.wm.obj_import, '.stl': bpy.ops.wm.stl_import, '.ply': bpy.ops.wm.ply_import,\n"
+    "           '.fbx': bpy.ops.import_scene.fbx, '.glb': bpy.ops.import_scene.gltf, '.gltf': bpy.ops.import_scene.gltf,\n"
+    "           '.usd': bpy.ops.wm.usd_import, '.usda': bpy.ops.wm.usd_import, '.usdc': bpy.ops.wm.usd_import,\n"
+    "           '.usdz': bpy.ops.wm.usd_import, '.abc': bpy.ops.wm.alembic_import}\n"
+    "    if i not in imp:\n"
+    "        sys.exit('Blender can\\'t open ' + i + ' files')\n"
+    "    imp[i](filepath=src)\n"
+    "exp = {'.obj': lambda: bpy.ops.wm.obj_export(filepath=dst), '.stl': lambda: bpy.ops.wm.stl_export(filepath=dst),\n"
+    "       '.ply': lambda: bpy.ops.wm.ply_export(filepath=dst), '.fbx': lambda: bpy.ops.export_scene.fbx(filepath=dst),\n"
+    "       '.glb': lambda: bpy.ops.export_scene.gltf(filepath=dst, export_format='GLB'),\n"
+    "       '.usd': lambda: bpy.ops.wm.usd_export(filepath=dst)}\n"
+    "exp[o]()\n";
+
+std::wstring CvQuote(const std::wstring& s) { return L"\"" + s + L"\""; }
+
+bool CvConvert(const CvJob& j, std::wstring& err) {
+    std::wstring srcExt = LowerStr(fs::path(j.src).extension().wstring());
+    std::wstring dst = DlUnique(j.dir, fs::path(j.src).stem().wstring() + L"." + j.ext);
+    bool ok = false;
+    bool picture = srcExt == L".png" || srcExt == L".jpg" || srcExt == L".jpeg" || srcExt == L".bmp" || srcExt == L".gif" ||
+                   srcExt == L".tif" || srcExt == L".tiff" || srcExt == L".heic" || srcExt == L".heif" || srcExt == L".webp";
+    if ((j.box == CB_IMAGE && j.ext != L"webp") || (j.box == CB_PAGES && picture && j.ext == L"pdf")) {
+        ok = CvImage(j.src, dst, j.ext, err);
+    } else if (j.box == CB_IMAGE || j.box == CB_MEDIA) {
+        if (j.ffmpeg.empty()) { err = L"this needs ffmpeg - press Install on the Video & audio box"; return false; }
+        static const std::pair<const wchar_t*, const wchar_t*> args[] = {
+            { L"mp4", L"-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart" },
+            { L"mov", L"-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -c:a aac -b:a 192k" },
+            { L"mkv", L"-c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 192k" },
+            { L"webm", L"-c:v libvpx-vp9 -crf 32 -b:v 0 -row-mt 1 -deadline good -cpu-used 4 -c:a libopus -b:a 128k" },
+            { L"gif", L"-vf \"fps=12,scale=480:-2:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse\" -loop 0" },
+            { L"mp3", L"-vn -c:a libmp3lame -q:a 2" },
+            { L"wav", L"-vn -c:a pcm_s16le" },
+            { L"m4a", L"-vn -c:a aac -b:a 192k" },
+            { L"webp", L"-frames:v 1 -c:v libwebp -quality 90" },
+        };
+        const wchar_t* a = L"";
+        for (const auto& p : args) if (j.ext == p.first) a = p.second;
+        ok = CvRun(CvQuote(j.ffmpeg) + L" -hide_banner -loglevel error -nostdin -i " + CvQuote(j.src) + L" " + a + L" " + CvQuote(dst), err);
+    } else if (j.box == CB_MODEL) {
+        if (j.tool.empty()) { err = L"this needs Blender - press Install"; return false; }
+        WriteUtf8(L"C:\\REICO\\convert_model.py", DlWide(CV_BLENDER_PY));
+        ok = CvRun(CvQuote(j.tool) + L" -b --factory-startup --python-exit-code 1 --python " + CvQuote(L"C:\\REICO\\convert_model.py") +
+                   L" -- " + CvQuote(j.src) + L" " + CvQuote(dst), err);
+    } else {
+        if (j.tool.empty()) { err = L"documents need LibreOffice - press Install"; return false; }
+        wchar_t tmp[MAX_PATH];
+        GetTempPathW(MAX_PATH, tmp);
+        std::wstring out = std::wstring(tmp) + L"reico_convert";
+        CreateDirectoryW(out.c_str(), nullptr);
+        std::wstring made = out + L"\\" + fs::path(j.src).stem().wstring() + L"." + j.ext;
+        DeleteFileW(made.c_str());
+        const wchar_t* filter = j.ext == L"txt" ? L"\"txt:Text (encoded):UTF8\"" : j.ext.c_str();
+        // its own profile: works even while you have LibreOffice open
+        ok = CvRun(CvQuote(j.tool) + L" -env:UserInstallation=file:///C:/REICO/lo_profile --headless --norestore " +
+                   (srcExt == L".pdf" ? L"--infilter=writer_pdf_import " : L"") + L"--convert-to " + filter +
+                   L" --outdir " + CvQuote(out) + L" " + CvQuote(j.src), err) &&
+             MoveFileExW(made.c_str(), dst.c_str(), MOVEFILE_COPY_ALLOWED);
+        if (!ok && err.empty()) err = L"LibreOffice can't turn this into " + j.ext;
+    }
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    if (ok && (!GetFileAttributesExW(dst.c_str(), GetFileExInfoStandard, &fa) || (fa.nFileSizeLow == 0 && fa.nFileSizeHigh == 0))) {
+        ok = false;
+        err = L"nothing came out";
+    }
+    if (!ok) DeleteFileW(dst.c_str());
+    return ok;
+}
+
+DWORD WINAPI CvWorker(void*) {
+    typedef HRESULT (WINAPI *PFN_CoInitEx)(LPVOID, DWORD);
+    if (auto init = reinterpret_cast<PFN_CoInitEx>(reinterpret_cast<void*>(GetProcAddress(LoadLibraryW(L"ole32.dll"), "CoInitializeEx"))))
+        init(nullptr, COINIT_MULTITHREADED);
+    for (;;) {
+        EnterCriticalSection(&g_cvCs);
+        if (g_cvQueue.empty()) { g_cvWorking = false; LeaveCriticalSection(&g_cvCs); return 0; }
+        CvJob j = g_cvQueue.front();
+        g_cvQueue.erase(g_cvQueue.begin());
+        g_cvBox[j.box].current = fs::path(j.src).filename().wstring();
+        LeaveCriticalSection(&g_cvCs);
+        std::wstring err;
+        bool ok = CvConvert(j, err);
+        EnterCriticalSection(&g_cvCs);
+        CvBox& b = g_cvBox[j.box];
+        if (ok) ++b.done;
+        else { ++b.failed; b.error = fs::path(j.src).filename().wstring() + L": " + err; }
+        b.current.clear();
+        LeaveCriticalSection(&g_cvCs);
+        Log(std::wstring(L"Converter: ") + (ok ? L"made " : L"failed ") + j.src + L" -> " + j.ext + (ok ? L"" : L" (" + err + L")"));
+    }
+}
+
+// -- the window (UI thread) --
+
+void CvSave() {
+    std::wstring t = g_cvDir + L"\n";
+    for (const auto& b : g_cvBox) t += std::to_wstring(b.fmt) + L" ";
+    WriteUtf8(CV_TXT, t + L"\n");
+}
+
+void CvAdd(int box, const std::vector<std::wstring>& files) {
+    if (files.empty()) return;
+    CvBox& b = g_cvBox[box];
+    for (int i = 0; i < CB_COUNT; ++i) g_cvTools[i] = CvTool(i); // something may have been installed meanwhile
+    std::wstring tool = g_cvTools[box], ffmpeg = g_cvTools[CB_MEDIA];
+    EnterCriticalSection(&g_cvCs);
+    if (b.done + b.failed >= b.total) { b.total = b.done = b.failed = 0; b.error.clear(); } // a new batch
+    for (const auto& f : files) g_cvQueue.push_back({ box, f, b.formats[b.fmt], g_cvDir, tool, ffmpeg });
+    b.total += static_cast<int>(files.size());
+    bool start = !g_cvWorking;
+    g_cvWorking = true;
+    LeaveCriticalSection(&g_cvCs);
+    if (start) {
+        HANDLE t = CreateThread(nullptr, 0, CvWorker, nullptr, 0, nullptr);
+        if (t) CloseHandle(t);
+        else { EnterCriticalSection(&g_cvCs); g_cvWorking = false; LeaveCriticalSection(&g_cvCs); }
+    }
+    SetTimer(g_cvWnd, CV_TIMER, 100, nullptr);
+}
+
+void CvPickFiles(int box) {
+    typedef BOOL (WINAPI *PFN_GetOpen)(LPOPENFILENAMEW);
+    static PFN_GetOpen getOpen = reinterpret_cast<PFN_GetOpen>(
+        reinterpret_cast<void*>(GetProcAddress(LoadLibraryW(L"comdlg32.dll"), "GetOpenFileNameW")));
+    if (!getOpen) return;
+    std::vector<wchar_t> buf(65536, L'\0');
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_cvWnd;
+    ofn.lpstrFilter = g_cvBox[box].filter;
+    ofn.lpstrFile = buf.data();
+    ofn.nMaxFile = static_cast<DWORD>(buf.size());
+    std::wstring title = L"Convert " + std::wstring(g_cvBox[box].title);
+    ofn.lpstrTitle = title.c_str();
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
+    if (!getOpen(&ofn)) return;
+    std::vector<std::wstring> files;
+    std::wstring first = buf.data(); // one file: its path; several: the folder, then each name
+    for (const wchar_t* p = buf.data() + first.size() + 1; *p; p += wcslen(p) + 1) files.push_back(first + L"\\" + p);
+    if (files.empty()) files.push_back(first);
+    CvAdd(box, files);
+}
+
+RECT CvBoxRect(int i) {
+    int x = CV_PAD + (i % 2) * (CV_BOX_W + 14), y = CV_HEAD + (i / 2) * (CV_BOX_H + 14);
+    return { x, y, x + CV_BOX_W, y + CV_BOX_H };
+}
+
+// Everything that doesn't change while the window is open (glass, boxes, titles, drop
+// zones), drawn once per opening: a full redraw is ~40 ms, too slow for every hover.
+std::vector<UINT32> g_cvBase;
+int g_cvChipW[CB_COUNT][8];
+
+void CvBuildBase() {
+    const COLORREF white = RGB(255, 255, 255);
+    Canvas c = g_cvS.cv();
+    ZeroMemory(c.px, sizeof(UINT32) * static_cast<size_t>(c.w) * c.h);
+    COLORREF tint = RGB(g_glassCfg.tintR, g_glassCfg.tintG, g_glassCfg.tintB);
+    COLORREF veil = RGB(GetRValue(tint) * 3 / 10 + 14, GetGValue(tint) * 3 / 10 + 14, GetBValue(tint) * 3 / 10 + 18);
+    FillRRect(c, 0.5f, 0.5f, CV_W - 0.5f, CV_H - 0.5f, 24, veil, 0.9f);
+    GlassLight(c, 0.5f, 0.5f, CV_W - 0.5f, CV_H - 0.5f, 24, 1.f);
+    DrawGlassText(c, g_cvMask, L"Converter", { CV_PAD + 2, 10, 400, 44 }, g_cvTitleF, 1.f, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 0.25f, 0.75f);
+    DrawTextOn(c, g_cvMask, L"Drop files on a box or click it \u00B7 pick the format \u00B7 done", { CV_PAD + 3, 42, CV_W - 80, 60 },
+               g_cvSmallF, white, 0.55f, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    for (int i = 0; i < CB_COUNT; ++i) {
+        CvBox& b = g_cvBox[i];
+        RECT r = CvBoxRect(i);
+        const float x0 = static_cast<float>(r.left), y0 = static_cast<float>(r.top), x1 = static_cast<float>(r.right);
+        FillRRect(c, x0, y0, x1, static_cast<float>(r.bottom), 18, white, 0.05f);
+        GlassLight(c, x0, y0, x1, static_cast<float>(r.bottom), 18, 0.7f);
+        GlassBlob(c, x0 + 16, y0 + 14, x0 + 56, y0 + 54, 20, 0.55f, 0.1f, 1.f);
+        DrawGlassText(c, g_cvMask, b.glyph, { r.left + 16, r.top + 14, r.left + 56, r.top + 54 }, g_cvGlyphF, 1.f,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE, 0.f, 0.85f);
+        DrawTextOn(c, g_cvMask, b.title, { r.left + 68, r.top + 14, r.right - 14, r.top + 34 }, g_cvNameF, white, 0.97f, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextOn(c, g_cvMask, b.inputs, { r.left + 68, r.top + 34, r.right - 14, r.top + 52 }, g_cvSmallF, white, 0.5f,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        FillRRect(c, x0 + 16, y0 + 64, x1 - 16, y0 + 124, 14, white, 0.05f); // the drop zone
+        GlassLight(c, x0 + 16, y0 + 64, x1 - 16, y0 + 124, 14, 0.4f);
+        DrawTextOn(c, g_cvMask, L"\uE898", { r.left + 16, r.top + 66, r.left + 70, r.top + 122 }, g_cvBigGlyphF, white, 0.6f,
+                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextOn(c, g_cvMask, L"Drop files here or click to choose", { r.left + 66, r.top + 64, r.right - 16, r.top + 124 }, g_cvSmallF,
+                   white, 0.75f, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        for (int k = 0; k < static_cast<int>(b.formats.size()); ++k) {
+            std::wstring t = b.formats[k];
+            for (auto& ch : t) ch = towupper(ch);
+            g_cvChipW[i][k] = TextWidth(t.c_str(), g_cvChipF) + 14;
+        }
+    }
+    const int by = CV_H - 62;
+    DrawTextOn(c, g_cvMask, L"Save to", { CV_PAD + 2, by, CV_PAD + 70, by + 36 }, g_cvNameF, white, 0.9f, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    FillRRect(c, CV_PAD + 76.f, by + 0.f, CV_W - 280.f, by + 36.f, 18, white, 0.07f);
+    GlassLight(c, CV_PAD + 76.f, by + 0.f, CV_W - 280.f, by + 36.f, 18, 0.5f);
+    DrawTextOn(c, g_cvMask, L"\uED25", { CV_PAD + 84, by, CV_PAD + 112, by + 36 }, g_cvGlyphF, white, 0.6f, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    g_cvBase.assign(c.px, c.px + static_cast<size_t>(c.w) * c.h);
+}
+
+void CvRender() {
+    if (!g_cvWnd) return;
+    const COLORREF white = RGB(255, 255, 255);
+    Canvas c = g_cvS.cv();
+    if (g_cvBase.size() != static_cast<size_t>(c.w) * c.h) CvBuildBase();
+    memcpy(c.px, g_cvBase.data(), g_cvBase.size() * sizeof(UINT32));
+    g_cvHits.clear();
+    float a = EaseOut3((GetTickCount() - g_cvOpenedAt) / 200.f);
+    auto hit = [&](RECT r, int id) { g_cvHits.push_back({ r, id }); return g_cvHot == id; };
+    auto chip = [&](RECT r, const wchar_t* text, int id, bool on, HFONT f) {
+        bool hot = hit(r, id);
+        GlassBlob(c, static_cast<float>(r.left), static_cast<float>(r.top), static_cast<float>(r.right), static_cast<float>(r.bottom),
+                  (r.bottom - r.top) / 2.f, on ? 0.65f : (hot ? 0.3f : 0.f), on ? 0.12f : (hot ? 0.16f : 0.07f), 1.f);
+        DrawTextOn(c, g_cvMask, text, r, f, white, on || hot ? 0.97f : 0.75f, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    };
+
+    hit({ 0, 0, CV_W - 60, CV_HEAD - 8 }, CVH_HEAD);
+    chip({ CV_W - CV_PAD - 34, 16, CV_W - CV_PAD, 50 }, L"\uE711", CVH_CLOSE, false, g_cvGlyphF);
+
+    for (int i = 0; i < CB_COUNT; ++i) {
+        CvBox& b = g_cvBox[i];
+        RECT r = CvBoxRect(i);
+        if (g_cvHot == i * 100 + 1) { // hovered: a tinted glow over the box, the drop zone a bit brighter
+            FillRRect(c, static_cast<float>(r.left), static_cast<float>(r.top), static_cast<float>(r.right), static_cast<float>(r.bottom),
+                      18, AccentColour(), 0.12f);
+            FillRRect(c, r.left + 16.f, r.top + 64.f, r.right - 16.f, r.top + 124.f, 14, white, 0.05f);
+        }
+        hit(r, i * 100 + 1); // chips added later sit on top (checked first: see CvHitAt)
+
+        // "convert to" chips
+        int cx = r.left + 16;
+        for (int k = 0; k < static_cast<int>(b.formats.size()); ++k) {
+            std::wstring t = b.formats[k];
+            for (auto& ch : t) ch = towupper(ch);
+            int cw = g_cvChipW[i][k];
+            chip({ cx, r.top + 136, cx + cw, r.top + 160 }, t.c_str(), i * 100 + 10 + k, k == b.fmt, g_cvChipF);
+            cx += cw + 5;
+        }
+
+        // status
+        EnterCriticalSection(&g_cvCs);
+        int total = b.total, done = b.done, failed = b.failed;
+        std::wstring cur = b.current, err = b.error;
+        LeaveCriticalSection(&g_cvCs);
+        std::wstring line;
+        float la = 0.6f;
+        bool needs = b.tool && g_cvTools[i].empty();
+        if (done + failed < total)
+            line = L"Converting " + (cur.empty() ? std::wstring(L"\u2026") : cur) + L"  (" + std::to_wstring(done + failed + 1) + L" of " + std::to_wstring(total) + L")";
+        else if (total > 0) {
+            line = std::to_wstring(done) + (done == 1 ? L" file converted" : L" files converted");
+            if (failed) line += L" \u00B7 " + err + (failed > 1 ? L" (+" + std::to_wstring(failed - 1) + L" more)" : L"");
+            la = 0.85f;
+        } else if (needs)
+            line = i == CB_PAGES ? L"Documents need LibreOffice (free)" : L"Needs " + std::wstring(b.tool) + L" (free)";
+        else
+            line = L"Ready";
+        int lineR = r.right - 16;
+        if (needs) {
+            chip({ r.right - 96, r.top + 172, r.right - 16, r.top + 198 }, L"Install", i * 100 + 90, true, g_cvChipF);
+            lineR = r.right - 104;
+        }
+        DrawTextOn(c, g_cvMask, line.c_str(), { r.left + 18, r.top + 172, lineR, r.top + 198 }, g_cvSmallF, white, la,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    // where everything goes
+    const int by = CV_H - 62;
+    DrawTextOn(c, g_cvMask, g_cvDir.c_str(), { CV_PAD + 116, by, CV_W - 292, by + 36 }, g_cvSmallF, white, 0.9f,
+               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
+    chip({ CV_W - 270, by + 3, CV_W - 170, by + 33 }, L"Change", CVH_CHANGE, false, g_cvChipF);
+    chip({ CV_W - 162, by + 3, CV_W - CV_PAD, by + 33 }, L"Open folder", CVH_OPEN, true, g_cvChipF);
+
+    POINT dst{ g_cvX, g_cvY + static_cast<int>((1.f - a) * 10.f) }, src{ 0, 0 };
+    SIZE sz{ CV_W, CV_H };
+    BLENDFUNCTION bf{ AC_SRC_OVER, 0, static_cast<BYTE>(255.f * a), AC_SRC_ALPHA };
+    UpdateLayeredWindow(g_cvWnd, nullptr, &dst, &sz, g_cvS.dc, &src, 0, &bf, ULW_ALPHA);
+}
+
+int CvHitAt(POINT p) {
+    for (auto it = g_cvHits.rbegin(); it != g_cvHits.rend(); ++it) // drawn last = on top
+        if (PtInRect(&it->r, p)) return it->id;
+    return CVH_NONE;
+}
+
+void CvClose() {
+    if (!g_cvVisible) return;
+    g_cvVisible = false;
+    LiquidRun(g_cvS, CV_W, CV_H, POINT{ g_cvX, g_cvY }, DockSideRect(SIDE_CONVERT), 24, false, nullptr); // pours back into its button
+    ShowWindow(g_cvWnd, SW_HIDE);
+    EnterCriticalSection(&g_cvCs);
+    bool busy = g_cvWorking;
+    LeaveCriticalSection(&g_cvCs);
+    if (!busy) KillTimer(g_cvWnd, CV_TIMER); // conversions keep going while it's closed
+}
+
+void CvClick(int id) {
+    if (id == CVH_CLOSE) { CvClose(); return; }
+    if (id == CVH_OPEN) { CreateDirectoryW(g_cvDir.c_str(), nullptr); ShellExecuteW(nullptr, L"open", g_cvDir.c_str(), nullptr, nullptr, SW_SHOWNORMAL); return; }
+    if (id == CVH_CHANGE) {
+        std::wstring d = g_cvDir;
+        if (DlPickFolder(d, g_cvWnd, L"Save converted files to")) { g_cvDir = d; CvSave(); }
+    } else if (id >= 0 && id < CB_COUNT * 100) {
+        int box = id / 100, part = id % 100;
+        if (part == 1) CvPickFiles(box);
+        else if (part == 90) // a visible console, so you can watch winget install it
+            ShellExecuteW(nullptr, L"open", L"cmd.exe", (std::wstring(L"/k winget install -e --id ") + g_cvBox[box].wingetId +
+                          L" --accept-source-agreements --accept-package-agreements").c_str(), nullptr, SW_SHOWNORMAL);
+        else if (part >= 10 && part < 10 + static_cast<int>(g_cvBox[box].formats.size())) { g_cvBox[box].fmt = part - 10; CvSave(); }
+    }
+    CvRender();
+}
+
+LRESULT CALLBACK CvProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    switch (msg) {
+    case WM_TIMER: {
+        CvRender();
+        EnterCriticalSection(&g_cvCs);
+        bool busy = g_cvWorking;
+        LeaveCriticalSection(&g_cvCs);
+        if (!busy && GetTickCount() - g_cvOpenedAt > 250) KillTimer(h, CV_TIMER);
+        return 0;
+    }
+    case WM_DROPFILES: {
+        HDROP drop = reinterpret_cast<HDROP>(w);
+        POINT p{};
+        DragQueryPoint(drop, &p);
+        int box = -1;
+        for (int i = 0; i < CB_COUNT; ++i) { RECT r = CvBoxRect(i); if (PtInRect(&r, p)) box = i; }
+        std::vector<std::wstring> files;
+        UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        for (UINT k = 0; k < n; ++k) {
+            wchar_t f[MAX_PATH * 2];
+            if (DragQueryFileW(drop, k, f, MAX_PATH * 2) && !(GetFileAttributesW(f) & FILE_ATTRIBUTE_DIRECTORY)) files.push_back(f);
+        }
+        DragFinish(drop);
+        if (box >= 0) CvAdd(box, files);
+        CvRender();
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        POINT p{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        if (g_cvMoving) {
+            POINT s;
+            GetCursorPos(&s);
+            g_cvX = s.x - g_cvMoveOff.x;
+            g_cvY = s.y - g_cvMoveOff.y;
+            SetWindowPos(h, nullptr, g_cvX, g_cvY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE); // just move: nothing to redraw
+            return 0;
+        }
+        TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, h, 0 };
+        TrackMouseEvent(&tme);
+        int hot = CvHitAt(p);
+        if (hot == CVH_HEAD) hot = CVH_NONE;
+        if (hot != g_cvHot) { g_cvHot = hot; CvRender(); }
+        return 0;
+    }
+    case WM_MOUSELEAVE: g_cvHot = CVH_NONE; CvRender(); return 0;
+    case WM_SETCURSOR: SetCursor(LoadCursor(nullptr, g_cvHot != CVH_NONE ? IDC_HAND : IDC_ARROW)); return TRUE;
+    case WM_LBUTTONDOWN: {
+        POINT p{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        g_cvPressed = CvHitAt(p);
+        if (g_cvPressed == CVH_HEAD) { // drag the window by its header
+            g_cvMoving = true;
+            g_cvMoveOff = p;
+            SetCapture(h);
+        }
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        if (g_cvMoving) { g_cvMoving = false; ReleaseCapture(); return 0; }
+        int id = CvHitAt(POINT{ GET_X_LPARAM(l), GET_Y_LPARAM(l) });
+        if (id == g_cvPressed && id != CVH_NONE) CvClick(id);
+        g_cvPressed = CVH_NONE;
+        return 0;
+    }
+    case WM_KEYDOWN:
+        if (w == VK_ESCAPE) CvClose();
+        return 0;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+
+void ConverterToggle() {
+    if (g_cvVisible) { CvClose(); return; }
+    if (!g_cvWnd) {
+        InitializeCriticalSection(&g_cvCs);
+        g_cvTitleF = InterFont(22, 700);
+        g_cvNameF = InterFont(15, 600);
+        g_cvSmallF = InterFont(12, 500);
+        g_cvChipF = InterFont(12, 600);
+        g_cvGlyphF = MakeFont(18, FW_NORMAL, L"Segoe MDL2 Assets");
+        g_cvBigGlyphF = MakeFont(24, FW_NORMAL, L"Segoe MDL2 Assets");
+        WNDCLASSW wc{};
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpfnWndProc = CvProc;
+        wc.lpszClassName = L"REICOConverter";
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        RegisterClassW(&wc);
+        // always on top (so it stays visible while you drag files from Explorer), but it
+        // doesn't close when you click elsewhere: × or Esc closes it
+        g_cvWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_ACCEPTFILES, L"REICOConverter", L"Converter",
+                                  WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
+        if (!g_cvWnd || !SurfCreate(g_cvS, CV_W, CV_H) || !SurfCreate(g_cvMask, CV_W, CV_H)) return;
+        std::wstring t = ReadTextFile(CV_TXT);
+        std::wstringstream ss(t);
+        std::getline(ss, g_cvDir);
+        while (!g_cvDir.empty() && iswspace(g_cvDir.back())) g_cvDir.pop_back();
+        for (auto& b : g_cvBox) { int f = 0; if (ss >> f && f >= 0 && f < static_cast<int>(b.formats.size())) b.fmt = f; }
+        if (g_cvDir.empty()) {
+            if (g_dlDir.empty()) DlLoadDir();
+            g_cvDir = g_dlDir;
+        }
+        RECT wa{};
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+        g_cvX = (wa.left + wa.right - CV_W) / 2;
+        g_cvY = (wa.top + wa.bottom - CV_H) / 2;
+    }
+    for (int i = 0; i < CB_COUNT; ++i) g_cvTools[i] = CvTool(i);
+    g_cvBase.clear(); // redrawn in the current tint
+    g_cvVisible = true;
+    g_cvHot = g_cvPressed = CVH_NONE;
+    RECT from = DockSideRect(SIDE_CONVERT);
+    bool liquid = LiquidWanted(from);
+    g_cvOpenedAt = GetTickCount() - (liquid ? 1000 : 0);
+    CvRender();
+    auto show = [] { ShowWindow(g_cvWnd, SW_SHOW); SetForegroundWindow(g_cvWnd); SetTimer(g_cvWnd, CV_TIMER, 15, nullptr); };
+    if (!liquid || !LiquidRun(g_cvS, CV_W, CV_H, POINT{ g_cvX, g_cvY }, from, 24, true, show)) show();
+}
+
 int DockHit(POINT p) {
-    const int sideHit[3] = { DH_GAMES, DH_TASKMGR, DH_NOTES };
-    for (int i = 0; i < 3; ++i) {
+    const int sideHit[4] = { DH_GAMES, DH_TASKMGR, DH_NOTES, DH_CONVERT };
+    for (int i = 0; i < 4; ++i) {
         int bx = DockSideX(i);
         if (bx >= 0 && p.y >= DOCK_TOP && p.y <= DOCK_TOP + DOCK_H && p.x >= bx && p.x <= bx + DOCK_H) return sideHit[i];
     }
@@ -8105,6 +9179,7 @@ LRESULT CALLBACK DockProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         int hit = DockHit(POINT{ GET_X_LPARAM(l), GET_Y_LPARAM(l) });
         if (hit == DH_GAMES) GameLauncherToggle();
         else if (hit == DH_NOTES) BoardToggle();
+        else if (hit == DH_CONVERT) ConverterToggle();
         else if (hit == DH_TASKMGR) { AllowSetForegroundWindow(ASFW_ANY); ShellExecuteW(nullptr, L"open", L"taskmgr.exe", nullptr, nullptr, SW_SHOWNORMAL); }
         else if (hit == DH_START) SendKeys({ VK_LWIN });
         else if (hit == DH_TRAY) // glass tray pop-up right under the button
@@ -8461,6 +9536,12 @@ LRESULT CALLBACK WndProc(
     LPARAM l
 ) {
     switch (msg) {
+
+    case WM_WINDOWPOSCHANGING: { // the icons live under every window: never let activation raise them
+        auto* wp = reinterpret_cast<WINDOWPOS*>(l);
+        if (!(wp->flags & SWP_NOZORDER)) wp->hwndInsertAfter = HWND_BOTTOM;
+        return 0;
+    }
 
     case WM_KEYDOWN:
 

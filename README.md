@@ -4,7 +4,7 @@
 
 <h1 align="center">REICO</h1>
 <p align="center"><b>iOS-style Liquid Glass / glassmorphism desktop for Windows 10</b><br>
-Frosted, translucent, tinted glass for windows, desktop icons and the taskbar, plus a glass now-playing widget, a game launcher, a photo/notes board and a fast multi-connection download manager, all in one small app.</p>
+Frosted, translucent, tinted glass for windows, desktop icons and the taskbar, plus a glass now-playing widget, a game launcher, a photo/notes board, a fast multi-connection download manager and an all-in-one file converter, all in one small app.</p>
 
 <p align="center">
   <a href="../../releases/latest/download/REICO.zip"><b>⬇ Download REICO (latest)</b></a> ·
@@ -32,6 +32,9 @@ REICO brings Apple's **Liquid Glass** look from **iOS 26** and macOS to Windows:
 
 ### 🪟 Liquid-glass windows
 File Explorer windows (or any window type you choose) become clear, tinted glass with a light rim and gloss. The tint is cut exactly to the window's edge, with no colour bleeding past it. Turn it on or off any time with **Ctrl+Shift+F6**.
+
+### 💧 Liquid animations
+REICO's windows don't just fade in; they **pour out of the button that opened them**. A glass drop beads on the button, stretches away on a liquid bridge that thins and snaps, then swells into the window with a soft spring and a jelly wobble while its content fades in. Closing pours it back in. It works for the game launcher, board, converter, tray, calendar and the glass panel. Frames are spread across your CPU cores (about 5 ms each). Switch it off in the panel (**Liquid animations**) for plain fades.
 
 ### 🧊 Glass desktop icons
 Your desktop icons are redrawn as glass in your tint: a frosted body, a specular edge, a darker thickness edge and a top gloss. A slider controls how much glass versus the original icon you see. Icons can be moved and resized, and the layout is saved.
@@ -102,6 +105,26 @@ Files under 1 MB, private/incognito windows and `blob:` downloads stay with the 
 
 <p align="center"><img src="docs/downloads.png" alt="REICO download manager: save prompt, multi-connection progress, done" width="470"></p>
 
+### 🔁 Converter: images, video, 3D models and documents
+The ⇄ button at the top-left opens a glass converter with four boxes. **Drag files onto a box** (or click it to pick them), choose the output format on its chips, and they're converted into the **Save to** folder at the bottom. Drop as many files as you like: they're converted one after another.
+
+| Box | Converts to | Reads |
+|---|---|---|
+| **Images** | PNG, JPG, WEBP, BMP, TIFF, GIF, ICO, PDF | PNG, JPG, HEIC, WEBP, BMP, TIFF, GIF, ICO… |
+| **Video & audio** | MP4, MKV, WEBM, MOV, GIF, MP3, WAV, M4A | almost any video or audio file |
+| **3D models** | OBJ, FBX, GLB, STL, PLY, USD | OBJ, FBX, GLB/GLTF, STL, PLY, USD, ABC, BLEND |
+| **Pages** | PDF, DOCX, ODT, TXT, HTML, RTF | DOCX, DOC, ODT, RTF, TXT, PDF, PPTX, XLSX… and images → PDF |
+
+**How it works:**
+- **Images** are converted inside REICO with Windows' own image codecs. Transparency is kept for PNG, WEBP, TIFF and ICO; JPG, BMP and GIF get a white background.
+- The other boxes use free tools. Each tool runs **hidden in the background** (no window, not even a splash screen) at **below-normal priority**, one file at a time, and **closes itself as soon as the file is written**. If you close REICO mid-way, they stop too.
+  - **ffmpeg** for video and audio (and WEBP).
+  - **Blender** in background mode for 3D models. Expect about 4 s per file while Blender starts.
+  - **LibreOffice** in headless mode for documents.
+- If a tool is missing, its box shows an **Install** button that installs it with winget. Pictures → PDF works without LibreOffice.
+
+<p align="center"><img src="docs/converter.png" alt="REICO converter: images, video & audio, 3D models and pages" width="760"></p>
+
 ### 🎵 Now playing
 When a song starts, changes or pauses, a glass card drops in at the top of the screen for 5 seconds. It shows the album art, the title and artist in glass lettering, bouncing glass beat bars, and **previous / play-pause / next** buttons. It works with any app that shows in the Windows volume flyout: Spotify, browsers and more. Hovering the card pauses its countdown.
 
@@ -113,7 +136,7 @@ Left-click REICO's tray icon to open the panel:
 - tint strength, window opacity and tint brightness
 - icon glass amount, brightness and edge softness, each with a **live preview** next to its slider
 - hover effects: **Lift / Shine / Bounce / None**
-- Extras: now-playing pop-up, glass taskbar, each top-left button (games, Task Manager, board) and the download manager on/off
+- Extras: now-playing pop-up, glass taskbar, each top-left button (games, Task Manager, board, converter) and the download manager on/off
 - drag the panel's top bar to move it anywhere
 - **presets** (Red glass, Clear glass, Dark smoke, and your own)
 
@@ -165,6 +188,8 @@ Everything in the panel is stored in `C:\REICO\glass.txt`. You can also edit it 
 | `hoverEffect` | `lift`, `shine`, `bounce` or `none` |
 | `nowPlaying` | Now-playing pop-up on/off |
 | `dock` | Glass taskbar on/off |
+| `btnGames`, `btnTaskMgr`, `btnNotes`, `btnConvert` | The round buttons at the top-left on/off |
+| `liquidAnim` | Windows pour out of their buttons (1) or just fade (0) |
 | `downloads` | Download manager on/off (1 = REICO takes browser downloads) |
 | `class=` | Which window types get glass (one per line). Default `CabinetWClass` = File Explorer |
 
@@ -201,7 +226,7 @@ The whole app is one file, `main.cpp`, plus the browser extension in `extension/
 
 ## Keywords
 
-liquid glass · iOS 26 liquid glass for Windows · glassmorphism · glass UI · polaroid / instax photo board · moodboard · sticky notes · bucket list · to-do checklist · frosted glass · translucent taskbar · transparent taskbar · glass dock · macOS-style dock · iPhone-style icons · tinted icons · acrylic · Windows 10 customization · Windows 10 theme · desktop customization · ricing · rice · aesthetic desktop · Rainmeter alternative · TranslucentTB alternative · now playing widget · Spotify widget · game launcher · download manager · download accelerator · IDM alternative · Internet Download Manager alternative · multi-connection downloader · segmented download · Chrome download manager · Win32 · C++
+liquid glass · iOS 26 liquid glass for Windows · glassmorphism · glass UI · polaroid / instax photo board · moodboard · sticky notes · bucket list · to-do checklist · frosted glass · translucent taskbar · transparent taskbar · glass dock · macOS-style dock · iPhone-style icons · tinted icons · acrylic · Windows 10 customization · Windows 10 theme · desktop customization · ricing · rice · aesthetic desktop · Rainmeter alternative · TranslucentTB alternative · now playing widget · Spotify widget · game launcher · download manager · download accelerator · IDM alternative · Internet Download Manager alternative · multi-connection downloader · segmented download · Chrome download manager · liquid animation · gooey animation · file converter · image converter · HEIC to JPG · video converter · MP4 to MP3 · 3D model converter · FBX to GLB · OBJ to STL · DOCX to PDF · ffmpeg GUI · Win32 · C++
 
 ## Credits & license
 
